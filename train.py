@@ -68,7 +68,7 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
         epochs, grad_B, label="Stream B (Relational)", color="tab:green", alpha=0.8
     )
     ax2.plot(epochs, grad_C, label="Stream C (Texture)", color="tab:orange", alpha=0.8)
-    ax1.set_yscale("log")
+    ax2.set_yscale("log")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Grad Norm")
     ax2.grid(True, linestyle="--", alpha=0.6)
