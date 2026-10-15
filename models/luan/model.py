@@ -127,16 +127,28 @@ class TripleStreamModel(nn.Module):
         )
 
         # --- Fusion層 (カスケード型アフィン変換) ---
-        self.fusion_A_to_B = nn.Conv2d(hidden_dim_A, hidden_dim_B, 1)
-        self.fusion_AB_to_C_gamma = nn.Conv2d(hidden_dim_B, hidden_dim_C, 1)
-        self.fusion_AB_to_C_beta = nn.Conv2d(hidden_dim_B, hidden_dim_C, 1)
+        self.fusion_A_to_B = nn.Conv2d(
+            hidden_dim_A, hidden_dim_B, kernel_size=3, padding=1
+        )
+        self.fusion_refine_AB = nn.Sequential(
+            nn.GroupNorm(8, hidden_dim_B),
+            nn.SiLU(),
+            nn.Conv2d(hidden_dim_B, hidden_dim_B, kernel_size=3, padding=1),
+            nn.SiLU(),
+        )
+        self.fusion_AB_to_C_gamma = nn.Conv2d(
+            hidden_dim_B, hidden_dim_C, kernel_size=3, padding=1
+        )
+        self.fusion_AB_to_C_beta = nn.Conv2d(
+            hidden_dim_B, hidden_dim_C, kernel_size=3, padding=1
+        )
 
         # 最終出力層
         self.out_norm = nn.GroupNorm(
             num_groups=min(8, hidden_dim_C), num_channels=hidden_dim_C
         )
         self.out_act = nn.GELU()
-        self.out_proj = nn.Conv2d(hidden_dim_C, in_channels, 3, padding=1)
+        self.out_proj = nn.Conv2d(hidden_dim_C, in_channels, kernel_size=3, padding=1)
 
     def forward(self, x, context, t):
         """
@@ -198,6 +210,7 @@ class TripleStreamModel(nn.Module):
         out_C = self.conv_C(h_C_attn)
 
         # === 5. Fusion層 (カスケード型アフィン変換) ===
+        """
         up_A = F.interpolate(
             out_A,
             size=(out_B.shape[2], out_B.shape[3]),
@@ -209,6 +222,23 @@ class TripleStreamModel(nn.Module):
         up_AB = F.interpolate(
             fusion_AB, size=(H, W), mode="bilinear", align_corners=False
         )
+        gamma = self.fusion_AB_to_C_gamma(up_AB)
+        beta = self.fusion_AB_to_C_beta(up_AB)
+        """
+
+        up_A = F.interpolate(
+            out_A,
+            size=(out_B.shape[2], out_B.shape[3]),
+            mode="bilinear",
+            align_corners=False,
+        )
+        fusion_AB = self.fusion_A_to_B(up_A) + out_B
+
+        up_AB = F.interpolate(
+            fusion_AB, size=(H, W), mode="bilinear", align_corners=False
+        )
+        # 拡大された特徴マップのボケを 3x3 Conv で引き締めてから gamma / beta を計算
+        up_AB = up_AB + self.fusion_refine_AB(up_AB)
         gamma = self.fusion_AB_to_C_gamma(up_AB)
         beta = self.fusion_AB_to_C_beta(up_AB)
 
