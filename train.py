@@ -437,7 +437,7 @@ def run_training(
     train_res=None,
     eval_res=None,
     multi_aspect=True,
-    lr=1e-3,
+    lr=5e-4,
     save_every_epochs=None,
     log_every_epochs=None,
     resume=None,
@@ -837,7 +837,7 @@ if __name__ == "__main__":
         help="指定するとマルチアスペクト比を無効化し、base-sizeの正方形に固定する",
     )
     parser.add_argument(
-        "--lr", type=float, default=1e-3, help="初期学習率 (デフォルト: 1e-3)"
+        "--lr", type=float, default=5e-4, help="初期学習率 (デフォルト: 5e-4)"
     )
     args = parser.parse_args()
 
