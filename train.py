@@ -3,6 +3,7 @@ import re
 import copy
 import csv
 import math
+import time
 import random
 import argparse
 from datetime import datetime
@@ -50,6 +51,101 @@ def parse_resolution(res_str):
         return (h, w)
     val = int(res_str)
     return (val, val)
+
+
+def parse_auto_int(val):
+    """引数に None / 'auto' / 0 以下が渡された場合は自動決定モード(None)にする"""
+    if val is None:
+        return None
+    if isinstance(val, str):
+        val_str = val.strip().lower()
+        if val_str in ("", "auto", "none", "0"):
+            return None
+        val = int(val_str)
+    return val if val > 0 else None
+
+
+def round_to_nice_step(val):
+    """数値を 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000... のキリの良い間隔に丸める"""
+    if val <= 1:
+        return 1
+    nice_steps = [
+        1,
+        2,
+        5,
+        10,
+        20,
+        25,
+        50,
+        100,
+        200,
+        250,
+        500,
+        1000,
+        2000,
+        2500,
+        5000,
+        10000,
+    ]
+    for s in nice_steps:
+        if val <= s:
+            return s
+    return int(round(val / 5000.0)) * 5000
+
+
+def estimate_target_iterations(dataset, batch_size, timesteps=1000):
+    """
+    データセットの枚数・割り当てバケットの平均ピクセル数・バッチサイズ・タイムステップ数から
+    収束に必要な目標イテレーション数を自動算出する。
+    """
+    num_images = max(1, len(dataset))
+
+    total_pixels = sum(
+        h * w * len(indices) for (h, w), indices in dataset.bucket_to_indices.items()
+    )
+    avg_pixels = total_pixels / num_images if total_pixels > 0 else 256 * 256
+
+    area_ratio = avg_pixels / (128.0 * 128.0)
+    res_factor = max(1.0, area_ratio**0.35)
+
+    base_iters_128 = 35000.0 + 9000.0 * math.sqrt(num_images)
+    batch_factor = (2.0 / max(1, batch_size)) ** 0.25
+    timestep_factor = (timesteps / 1000.0) ** 0.5
+
+    raw_iters = base_iters_128 * res_factor * batch_factor * timestep_factor
+    target_iters = max(20000, int(round(raw_iters / 5000.0)) * 5000)
+    return target_iters
+
+
+def estimate_save_every_epochs(epochs, iters_per_epoch):
+    """
+    全学習工程で約20〜25回のチェックポイント保存（または約4,000イテレーション間隔）
+    になるよう保存エポック間隔を自動決定する。
+    """
+    total_iters = epochs * iters_per_epoch
+    # 全工程で20〜25回程度、かつ1回あたり2,500〜5,000イテレーション程度を目安にする
+    target_ckpt_count = min(25, max(10, total_iters // 4000))
+    raw_epochs = max(1, epochs / max(1, target_ckpt_count))
+    return min(epochs, round_to_nice_step(raw_epochs))
+
+
+def estimate_log_every_epochs(epochs, iters_per_epoch, save_every_epochs):
+    """
+    チェックポイント保存時以外にターミナルへ進捗を表示するエポック間隔を自動決定する。
+    （約100〜200イテレーションごと、またはチェックポイント間隔の約1/10）
+    """
+    by_iters = max(1, round(150.0 / max(1, iters_per_epoch)))
+    by_save = max(1, save_every_epochs // 10)
+    raw_log = min(by_iters, by_save)
+    return min(save_every_epochs, round_to_nice_step(raw_log))
+
+
+def format_duration(seconds):
+    """秒数を HH:MM:SS 形式の文字列に変換する"""
+    seconds = max(0, int(round(seconds)))
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 
 def get_cosine_alpha_cumprod(t, max_steps=1000, s=0.008):
@@ -316,7 +412,6 @@ def resolve_resume_paths(resume_arg):
     else:
         ckpt_file = resume_arg
         ckpt_subdir = os.path.dirname(ckpt_file)
-        # model.pth が指定されていても、同階層に完全状態の checkpoint.pt があれば優先利用
         sibling_full = os.path.join(ckpt_subdir, "checkpoint.pt")
         if os.path.basename(ckpt_file) == "model.pth" and os.path.exists(sibling_full):
             ckpt_file = sibling_full
@@ -335,14 +430,16 @@ def run_training(
     datasets_root="datasets",
     checkpoints_root="checkpoints",
     batch_size=2,
-    target_iterations=50000,
+    target_iterations=None,
     timesteps=1000,
-    base_size=128,
+    base_size=256,
+    min_short_edge=256,
     train_res=None,
     eval_res=None,
     multi_aspect=True,
     lr=1e-3,
-    save_every_epochs=50,
+    save_every_epochs=None,
+    log_every_epochs=None,
     resume=None,
 ):
     print(f"--- Starting Production Training (Subset: {subset}) ---")
@@ -359,6 +456,7 @@ def run_training(
         subset=subset,
         datasets_root=datasets_root,
         base_size=base_size,
+        min_short_edge=min_short_edge,
         fixed_res=train_res,
         multi_aspect=multi_aspect,
     )
@@ -373,7 +471,33 @@ def run_training(
     dataloader = DataLoader(dataset, batch_sampler=batch_sampler)
 
     iters_per_epoch = len(dataloader)
+
+    # 1. 目標イテレーション数の決定
+    if target_iterations is None or target_iterations <= 0:
+        target_iterations = estimate_target_iterations(
+            dataset, batch_size=batch_size, timesteps=timesteps
+        )
+        iter_mode_str = "Auto"
+    else:
+        iter_mode_str = "Manual"
+
     epochs = math.ceil(target_iterations / iters_per_epoch)
+
+    # 2. チェックポイント保存間隔の決定
+    if save_every_epochs is None or save_every_epochs <= 0:
+        save_every_epochs = estimate_save_every_epochs(epochs, iters_per_epoch)
+        save_mode_str = "Auto"
+    else:
+        save_mode_str = "Manual"
+
+    # 3. ターミナル進捗ログ出力間隔の決定
+    if log_every_epochs is None or log_every_epochs <= 0:
+        log_every_epochs = estimate_log_every_epochs(
+            epochs, iters_per_epoch, save_every_epochs
+        )
+        log_mode_str = "Auto"
+    else:
+        log_mode_str = "Manual"
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=epochs, eta_min=1e-5
@@ -391,7 +515,6 @@ def run_training(
         ckpt_data = torch.load(ckpt_file, map_location=device, weights_only=False)
 
         if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
-            # 1. 完全なチェックポイント (checkpoint.pt) からの復元
             model.load_state_dict(ckpt_data["model_state_dict"])
             ema.ema_model.load_state_dict(
                 ckpt_data.get("ema_state_dict", ckpt_data["model_state_dict"])
@@ -411,7 +534,6 @@ def run_training(
                     os.path.join(ckpt_subdir, "metrics.csv")
                 )
         else:
-            # 2. 既存の重みファイル (model.pth) からの復元
             model.load_state_dict(ckpt_data)
             ema.ema_model.load_state_dict(ckpt_data)
 
@@ -431,7 +553,6 @@ def run_training(
                         "Warning: エポック/イテレーション番号が特定できないため Epoch 0 から再開します。"
                     )
 
-            # スケジューラを再開エポックまで進める
             for _ in range(start_epoch):
                 scheduler.step()
 
@@ -451,11 +572,16 @@ def run_training(
     print(f"Checkpoint Root Directory: {run_dir}")
 
     active_buckets = {k: len(v) for k, v in dataset.bucket_to_indices.items()}
+    total_planned_iters = epochs * iters_per_epoch
     print(f"Active Aspect Ratio Buckets (H, W): {active_buckets}")
     print(
-        f"Total Images: {len(dataset)} | Batch Size: {batch_size} | Timesteps: {timesteps} | "
-        f"Save Every: {save_every_epochs} epochs | "
-        f"Target Epochs: {epochs} (Total Iters: {epochs * iters_per_epoch})"
+        f"Total Images: {len(dataset)} | Batch Size: {batch_size} | "
+        f"Iters/Epoch: {iters_per_epoch} | Timesteps: {timesteps}"
+    )
+    print(
+        f"Schedule -> Target Iters ({iter_mode_str}): {total_planned_iters} ({epochs} epochs) | "
+        f"Save Every ({save_mode_str}): {save_every_epochs} ep (~{save_every_epochs * iters_per_epoch} iters) | "
+        f"Log Every ({log_mode_str}): {log_every_epochs} ep (~{log_every_epochs * iters_per_epoch} iters)"
     )
 
     if start_epoch >= epochs:
@@ -465,11 +591,15 @@ def run_training(
         )
         return
 
+    train_start_time = time.time()
+    epoch_digit_width = len(str(epochs))
+    iter_digit_width = len(str(total_planned_iters))
+
     for epoch in range(start_epoch + 1, epochs + 1):
         epoch_loss = 0.0
-        grad_norm_A = 0.0
-        grad_norm_B = 0.0
-        grad_norm_C = 0.0
+        grad_norm_A_sum = 0.0
+        grad_norm_B_sum = 0.0
+        grad_norm_C_sum = 0.0
 
         for images, contexts in dataloader:
             images = images.to(device)
@@ -510,18 +640,18 @@ def run_training(
 
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
-            grad_norm_A = (
+            grad_norm_A_sum += (
                 model.attn_A.in_proj_weight.grad.norm().item()
                 if hasattr(model, "attn_A")
                 and model.attn_A.in_proj_weight.grad is not None
                 else 0.0
             )
-            grad_norm_B = (
+            grad_norm_B_sum += (
                 model.mix_B[0].weight.grad.norm().item()
                 if hasattr(model, "mix_B") and model.mix_B[0].weight.grad is not None
                 else 0.0
             )
-            grad_norm_C = (
+            grad_norm_C_sum += (
                 model.cross_attn_C.in_proj_weight.grad.norm().item()
                 if hasattr(model, "cross_attn_C")
                 and model.cross_attn_C.in_proj_weight.grad is not None
@@ -534,7 +664,11 @@ def run_training(
             global_iter += 1
 
         scheduler.step()
-        avg_loss = epoch_loss / len(dataloader)
+        num_batches = len(dataloader)
+        avg_loss = epoch_loss / num_batches
+        grad_norm_A = grad_norm_A_sum / num_batches
+        grad_norm_B = grad_norm_B_sum / num_batches
+        grad_norm_C = grad_norm_C_sum / num_batches
 
         metrics_history.append(
             {
@@ -547,21 +681,33 @@ def run_training(
             }
         )
 
-        if (
+        is_save_step = (
             epoch % save_every_epochs == 0
             or epoch == start_epoch + 1
             or epoch == epochs
-        ):
+        )
+        is_log_step = (epoch % log_every_epochs == 0) or is_save_step
+
+        if is_log_step:
             current_lr = scheduler.get_last_lr()[0]
+            elapsed = time.time() - train_start_time
+            done_epochs = epoch - start_epoch
+            remain_epochs = epochs - epoch
+            eta_sec = (elapsed / max(1, done_epochs)) * remain_epochs
+            progress_pct = (epoch / epochs) * 100.0
+
             print(
-                f"Epoch [{epoch:04d}/{epochs}] (Iter: {global_iter}) | "
-                f"Loss: {avg_loss:.6f} | LR: {current_lr:.2e}"
-            )
-            print(
-                f"  Grad Norms -> Stream A: {grad_norm_A:.4f} | "
-                f"Stream B: {grad_norm_B:.4f} | Stream C: {grad_norm_C:.4f}"
+                f"[Progress {progress_pct:5.1f}%] "
+                f"Epoch [{epoch:{epoch_digit_width}d}/{epochs}] "
+                f"(Iter: {global_iter:{iter_digit_width}d}/{total_planned_iters}) | "
+                f"Loss: {avg_loss:.6f} | "
+                f"Grad(A/B/C): {grad_norm_A:.4f}/{grad_norm_B:.4f}/{grad_norm_C:.4f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Elapsed: {format_duration(elapsed)} | ETA: {format_duration(eta_sec)}",
+                flush=True,
             )
 
+        if is_save_step:
             ckpt_subdir = os.path.join(run_dir, f"epoch{epoch}_iter{global_iter}")
             os.makedirs(ckpt_subdir, exist_ok=True)
 
@@ -594,7 +740,10 @@ def run_training(
                 max_steps=timesteps,
                 eval_res=eval_res,
             )
-            print(f"  -> Saved checkpoint, metrics, and samples to {ckpt_subdir}")
+            print(
+                f"  --> [Checkpoint Saved] {ckpt_subdir}",
+                flush=True,
+            )
 
     print("--- Training Finished ---")
     final_path = os.path.join(run_dir, "model_final.pth")
@@ -634,15 +783,26 @@ if __name__ == "__main__":
         "--save-every",
         "--save_every",
         dest="save_every",
-        type=int,
-        default=200,
-        help="チェックポイント保存間隔（エポック単位、デフォルト: 50）",
+        type=str,
+        default="auto",
+        help="チェックポイント保存間隔（エポック単位、'auto' または 0 で自動決定）",
+    )
+    parser.add_argument(
+        "--log-every",
+        "--log_every",
+        dest="log_every",
+        type=str,
+        default="auto",
+        help="ターミナルへの進捗出力間隔（エポック単位、'auto' または 0 で自動決定）",
     )
     parser.add_argument(
         "--batch-size", type=int, default=2, help="バッチサイズ (デフォルト: 2)"
     )
     parser.add_argument(
-        "--target-iters", type=int, default=100_000, help="目標イテレーション数"
+        "--target-iters",
+        type=str,
+        default="auto",
+        help="目標イテレーション数 ('auto' または 0 でデータセット規模・解像度から自動算出)",
     )
     parser.add_argument(
         "--timesteps", "-t", type=int, default=1000, help="ノイズのタイムステップ数"
@@ -650,20 +810,26 @@ if __name__ == "__main__":
     parser.add_argument(
         "--base-size",
         type=int,
-        default=128,
-        help="マルチアスペクト比バケットの基準解像度 (例: 128, 256, 512)",
+        default=256,
+        help="マルチアスペクト比バケットの短辺基準解像度 (デフォルト: 256)",
+    )
+    parser.add_argument(
+        "--min-short-edge",
+        type=int,
+        default=256,
+        help="バケットの最小短辺ピクセル数 (デフォルト: 256)",
     )
     parser.add_argument(
         "--train-res",
         type=str,
         default=None,
-        help="学習解像度を固定したい場合に指定 (例: '128' または '128x192')",
+        help="学習解像度を固定したい場合に指定 (例: '256' または '256x384')",
     )
     parser.add_argument(
         "--eval-res",
         type=str,
         default=None,
-        help="チェックポイント推論時の出力解像度を指定 (例: '128x192')",
+        help="チェックポイント推論時の出力解像度を指定 (例: '256x384')",
     )
     parser.add_argument(
         "--no-multi-aspect",
@@ -680,13 +846,15 @@ if __name__ == "__main__":
         datasets_root=args.datasets_root,
         checkpoints_root=args.checkpoints_root,
         batch_size=args.batch_size,
-        target_iterations=args.target_iters,
+        target_iterations=parse_auto_int(args.target_iters),
         timesteps=args.timesteps,
         base_size=args.base_size,
+        min_short_edge=args.min_short_edge,
         train_res=parse_resolution(args.train_res),
         eval_res=parse_resolution(args.eval_res),
         multi_aspect=not args.no_multi_aspect,
         lr=args.lr,
-        save_every_epochs=args.save_every,
+        save_every_epochs=parse_auto_int(args.save_every),
+        log_every_epochs=parse_auto_int(args.log_every),
         resume=args.resume,
     )

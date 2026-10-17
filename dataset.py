@@ -10,24 +10,24 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 
 
-def generate_aspect_buckets(base_size=128, step=32, max_ratio=2.0):
+def generate_aspect_buckets(
+    base_size=256, step=32, max_ratio=2.0, min_short_edge=256
+):
     """
-    base_size * base_size の総ピクセル数を維持しつつ、
-    step(32)の倍数となる (H, W) アスペクト比バケット一覧を自動生成する
+    短辺を min_short_edge (デフォルト256px) 以上に保証しつつ、
+    step(32)の倍数となる (H, W) アスペクト比バケット一覧を自動生成する。
     """
-    target_area = base_size * base_size
-    buckets = set()
-    min_dim = max(step, int(base_size / math.sqrt(max_ratio) // step) * step)
-    max_dim = int(base_size * math.sqrt(max_ratio) // step) * step
+    short_edge = max(step, ((max(base_size, min_short_edge) + step - 1) // step) * step)
+    max_long_edge = int(round(short_edge * max_ratio / step)) * step
 
-    for h in range(min_dim, max_dim + step, step):
-        w = round((target_area / h) / step) * step
-        w = max(min_dim, min(max_dim, w))
-        if (1.0 / max_ratio) <= (h / w) <= max_ratio:
-            buckets.add((h, w))
+    buckets = set()
+    for long_edge in range(short_edge, max_long_edge + step, step):
+        if (long_edge / short_edge) <= max_ratio:
+            buckets.add((short_edge, long_edge))
+            buckets.add((long_edge, short_edge))
 
     if not buckets:
-        buckets.add((base_size, base_size))
+        buckets.add((short_edge, short_edge))
     return sorted(list(buckets))
 
 
@@ -51,13 +51,15 @@ class VisualDataset(Dataset):
         self,
         subset,
         datasets_root="datasets",
-        base_size=128,
+        base_size=256,
+        min_short_edge=256,
         fixed_res=None,
         multi_aspect=True,
     ):
         """
+        base_size / min_short_edge: 短辺の最小基準解像度 (デフォルト: 256px)。
         fixed_res: (H, W) タプルが指定された場合は全画像をその解像度に固定。
-        multi_aspect: True の場合、各画像の元アスペクト比に最も近いバケット解像度を割り当てる。
+        multi_aspect: True の場合、短辺 >= min_short_edge を満たす最も近いアスペクト比バケットを割り当てる。
         """
         self.data_dir = os.path.join(datasets_root, subset)
         if not os.path.exists(self.data_dir):
@@ -65,12 +67,19 @@ class VisualDataset(Dataset):
                 f"データセットディレクトリが存在しません: {self.data_dir}"
             )
 
+        effective_short = max(base_size, min_short_edge)
+
         if fixed_res is not None:
             self.buckets = [fixed_res]
         elif multi_aspect:
-            self.buckets = generate_aspect_buckets(base_size=base_size, step=32)
+            self.buckets = generate_aspect_buckets(
+                base_size=effective_short,
+                step=32,
+                max_ratio=2.0,
+                min_short_edge=effective_short,
+            )
         else:
-            self.buckets = [(base_size, base_size)]
+            self.buckets = [(effective_short, effective_short)]
 
         self.to_tensor_norm = transforms.Compose(
             [
@@ -81,6 +90,7 @@ class VisualDataset(Dataset):
 
         self.samples = []
         self.bucket_to_indices = defaultdict(list)
+        upscaled_count = 0
 
         for file in sorted(os.listdir(self.data_dir)):
             if file.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
@@ -99,6 +109,9 @@ class VisualDataset(Dataset):
                 if os.path.exists(text_path):
                     with Image.open(img_path) as im:
                         orig_w, orig_h = im.size
+                    if min(orig_w, orig_h) < effective_short:
+                        upscaled_count += 1
+
                     orig_aspect = orig_h / orig_w
 
                     # 最もアスペクト比が近いバケットを選択
@@ -112,6 +125,11 @@ class VisualDataset(Dataset):
                     print(
                         f"Warning: 対応するテンソルが見つかりません ({file} -> {text_filename})"
                     )
+
+        if upscaled_count > 0:
+            print(
+                f"Info: 短辺が {effective_short}px 未満の画像が {upscaled_count} 枚含まれています（BICUBIC拡大を適用します）。"
+            )
 
     def __len__(self):
         return len(self.samples)
