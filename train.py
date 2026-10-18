@@ -8,6 +8,7 @@ import time
 import random
 import argparse
 from datetime import datetime
+import urllib.request
 
 import numpy as np
 import torch
@@ -27,38 +28,53 @@ from models.luan.model import TripleStreamModel
 from dataset import VisualDataset, AspectRatioBatchSampler
 
 
-def setup_japanese_font():
-    """matplotlibで日本語トークンが文字化けしないよう利用可能なフォントを自動設定する"""
-    candidates = [
-        "Noto Sans CJK JP",
-        "IPAGothic",
-        "IPAPGothic",
-        "Yu Gothic",
-        "Meiryo",
-        "Hiragino Sans",
-        "MS Gothic",
-    ]
-    available_fonts = {f.name for f in fm.fontManager.ttflist}
-    for font in candidates:
-        if font in available_fonts:
-            plt.rcParams["font.sans-serif"] = [font]
-            plt.rcParams["axes.unicode_minus"] = False
-            return
-    # Colab等のLinux環境でフォントパスを直接探索
-    linux_font_paths = [
+_JP_FONT_PROP = None
+
+
+def get_japanese_font_prop():
+    """
+    環境に日本語フォントが無い場合でも、NotoSansJPを自動取得して
+    文字化け（□□□）を100%防ぐ FontProperties を返す
+    """
+    global _JP_FONT_PROP
+    if _JP_FONT_PROP is not None:
+        return _JP_FONT_PROP
+
+    # 1. システム内の既存フォントを探索
+    search_paths = [
         "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+        "C:/Windows/Fonts/meiryo.ttc",
+        "C:/Windows/Fonts/msgothic.ttc",
+        "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
     ]
-    for path in linux_font_paths:
-        if os.path.exists(path):
-            fm.fontManager.addfont(path)
-            prop = fm.FontProperties(fname=path)
-            plt.rcParams["font.sans-serif"] = [prop.get_name()]
-            plt.rcParams["axes.unicode_minus"] = False
-            return
+    for p in search_paths:
+        if os.path.exists(p):
+            fm.fontManager.addfont(p)
+            _JP_FONT_PROP = fm.FontProperties(fname=p)
+            return _JP_FONT_PROP
 
+    # 2. 見つからない場合はキャッシュに NotoSansJP-Regular.otf を自動ダウンロード
+    cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "fonts")
+    os.makedirs(cache_dir, exist_ok=True)
+    font_path = os.path.join(cache_dir, "NotoSansJP-Regular.otf")
 
-setup_japanese_font()
+    if not os.path.exists(font_path):
+        url = "https://raw.githubusercontent.com/googlefonts/noto-cjk/main/Sans/OTF/Japanese/NotoSansCJKjp-Regular.otf"
+        try:
+            print("Downloading Japanese font for heatmap labels...")
+            urllib.request.urlretrieve(url, font_path)
+        except Exception as e:
+            print(f"Warning: 日本語フォントの自動取得に失敗しました ({e})")
+            return None
+
+    if os.path.exists(font_path):
+        fm.fontManager.addfont(font_path)
+        _JP_FONT_PROP = fm.FontProperties(fname=font_path)
+        return _JP_FONT_PROP
+
+    return None
 
 
 class EMAModel:
@@ -104,7 +120,22 @@ def round_to_nice_step(val):
     if val <= 1:
         return 1
     nice_steps = [
-        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000
+        1,
+        2,
+        5,
+        10,
+        20,
+        25,
+        50,
+        100,
+        200,
+        250,
+        500,
+        1000,
+        2000,
+        2500,
+        5000,
+        10000,
     ]
     for s in nice_steps:
         if val <= s:
@@ -176,8 +207,11 @@ def compute_ssim(img1, img2, window_size=11):
         img2 = img2.unsqueeze(0)
 
     C = img1.size(1)
-    coords = torch.arange(window_size, dtype=img1.dtype, device=img1.device) - window_size // 2
-    g = torch.exp(-(coords ** 2) / (2 * 1.5 ** 2))
+    coords = (
+        torch.arange(window_size, dtype=img1.dtype, device=img1.device)
+        - window_size // 2
+    )
+    g = torch.exp(-(coords**2) / (2 * 1.5**2))
     g = g / g.sum()
     window = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
     window = window.expand(C, 1, window_size, window_size).contiguous()
@@ -194,8 +228,8 @@ def compute_ssim(img1, img2, window_size=11):
     sigma2_sq = F.conv2d(img2 * img2, window, padding=pad, groups=C) - mu2_sq
     sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=C) - mu1_mu2
 
-    C1 = 0.01 ** 2
-    C2 = 0.03 ** 2
+    C1 = 0.01**2
+    C2 = 0.03**2
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
         (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
     )
@@ -269,14 +303,24 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
                     f"{row['grad_B']:.6f}",
                     f"{row['grad_C']:.6f}",
                     f"{row.get('lr', 0.0):.2e}",
-                    f"{row['eval_psnr']:.2f}" if row.get("eval_psnr") is not None else "",
-                    f"{row['eval_ssim']:.4f}" if row.get("eval_ssim") is not None else "",
+                    (
+                        f"{row['eval_psnr']:.2f}"
+                        if row.get("eval_psnr") is not None
+                        else ""
+                    ),
+                    (
+                        f"{row['eval_ssim']:.4f}"
+                        if row.get("eval_ssim") is not None
+                        else ""
+                    ),
                 ]
             )
 
     epochs = [row["epoch"] for row in metrics_history]
     losses = [max(row["loss"], 1e-7) for row in metrics_history]
-    mse_losses = [max(row.get("mse_loss", row["loss"]), 1e-7) for row in metrics_history]
+    mse_losses = [
+        max(row.get("mse_loss", row["loss"]), 1e-7) for row in metrics_history
+    ]
     l1_losses = [max(row.get("l1_loss", row["loss"]), 1e-7) for row in metrics_history]
     grad_A = [max(row["grad_A"], 1e-8) for row in metrics_history]
     grad_B = [max(row["grad_B"], 1e-8) for row in metrics_history]
@@ -291,9 +335,25 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 11), sharex=True)
 
     # 1段目: Hybrid Loss / Raw MSE / Raw L1
-    ax1.plot(epochs, losses, label="Min-SNR Hybrid Loss", color="tab:red", linewidth=1.2)
-    ax1.plot(epochs, l1_losses, label="Raw L1 (Edge/Detail)", color="tab:purple", alpha=0.6, linewidth=0.9)
-    ax1.plot(epochs, mse_losses, label="Raw MSE (Global Color)", color="tab:brown", alpha=0.6, linewidth=0.9)
+    ax1.plot(
+        epochs, losses, label="Min-SNR Hybrid Loss", color="tab:red", linewidth=1.2
+    )
+    ax1.plot(
+        epochs,
+        l1_losses,
+        label="Raw L1 (Edge/Detail)",
+        color="tab:purple",
+        alpha=0.6,
+        linewidth=0.9,
+    )
+    ax1.plot(
+        epochs,
+        mse_losses,
+        label="Raw MSE (Global Color)",
+        color="tab:brown",
+        alpha=0.6,
+        linewidth=0.9,
+    )
     ax1.set_yscale("log")
     ax1.set_ylabel("Loss (Log Scale)")
     ax1.set_title("Training Losses, Stream Gradient Norms & Image Quality Metrics")
@@ -302,7 +362,9 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
 
     # 2段目: Stream A / B / C 勾配ノルム
     ax2.plot(epochs, grad_A, label="Stream A (Global)", color="tab:blue", alpha=0.8)
-    ax2.plot(epochs, grad_B, label="Stream B (Relational)", color="tab:green", alpha=0.8)
+    ax2.plot(
+        epochs, grad_B, label="Stream B (Relational)", color="tab:green", alpha=0.8
+    )
     ax2.plot(epochs, grad_C, label="Stream C (Texture)", color="tab:orange", alpha=0.8)
     ax2.set_yscale("log")
     ax2.set_ylabel("Grad Norm (Log Scale)")
@@ -317,10 +379,21 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
         ev_ssim = [p[2] for p in eval_pts]
 
         l1 = ax3.plot(
-            ev_epochs, ev_psnr, marker="o", color="tab:cyan", linewidth=1.5, label="Eval PSNR (dB)"
+            ev_epochs,
+            ev_psnr,
+            marker="o",
+            color="tab:cyan",
+            linewidth=1.5,
+            label="Eval PSNR (dB)",
         )
         l2 = ax3_right.plot(
-            ev_epochs, ev_ssim, marker="s", color="tab:pink", linewidth=1.5, linestyle="--", label="Eval SSIM"
+            ev_epochs,
+            ev_ssim,
+            marker="s",
+            color="tab:pink",
+            linewidth=1.5,
+            linestyle="--",
+            label="Eval SSIM",
         )
         lines = l1 + l2
         labels = [l.get_label() for l in lines]
@@ -349,6 +422,7 @@ def get_tokenizer():
     if _CACHED_TOKENIZER is None:
         try:
             from transformers import AutoTokenizer
+
             _CACHED_TOKENIZER = AutoTokenizer.from_pretrained(
                 "cl-tohoku/bert-base-japanese-v3"
             )
@@ -359,20 +433,35 @@ def get_tokenizer():
 
 
 def find_caption_for_sample(dataset, ds_idx):
-    """datasetのサンプルインデックスから対応する元キャプション文字列を取得する"""
+    """datasetの属性名に依存せず、ds_idx番目の画像に対応するキャプション文字列を確実に取得する"""
     img_path = None
-    for attr in ("samples", "image_paths", "files", "data"):
-        if hasattr(dataset, attr):
-            item = getattr(dataset, attr)[ds_idx]
-            if isinstance(item, str):
-                img_path = item
-            elif isinstance(item, (tuple, list)) and len(item) > 0:
-                img_path = item[0]
-            elif isinstance(item, dict):
-                img_path = item.get("image_path") or item.get("image") or item.get("path")
-            break
 
-    if img_path is None or not isinstance(img_path, str):
+    # datasetオブジェクト内のリスト/タプル属性からファイルパスを探索
+    for attr_name, attr_val in vars(dataset).items():
+        if isinstance(attr_val, list) and len(attr_val) > ds_idx:
+            elem = attr_val[ds_idx]
+            if isinstance(elem, str) and any(
+                elem.lower().endswith(ext)
+                for ext in (".png", ".jpg", ".jpeg", ".webp", ".pt")
+            ):
+                img_path = elem
+                break
+            elif (
+                isinstance(elem, (tuple, list))
+                and len(elem) > 0
+                and isinstance(elem[0], str)
+            ):
+                img_path = elem[0]
+                break
+            elif isinstance(elem, dict):
+                for k in ("image_path", "img_path", "image", "path", "pt_path"):
+                    if k in elem and isinstance(elem[k], str):
+                        img_path = elem[k]
+                        break
+                if img_path:
+                    break
+
+    if img_path is None:
         return None
 
     base_no_ext = os.path.splitext(img_path)[0]
@@ -381,29 +470,30 @@ def find_caption_for_sample(dataset, ds_idx):
         with open(txt_path, "r", encoding="utf-8") as f:
             return f.read().strip()
 
-    # captions.json がある場合のフォールバック
     folder = os.path.dirname(img_path)
     json_path = os.path.join(folder, "captions.json")
     if os.path.exists(json_path):
         with open(json_path, "r", encoding="utf-8") as f:
             cap_dict = json.load(f)
         fname = os.path.basename(img_path)
+        bname = os.path.basename(base_no_ext)
         if fname in cap_dict:
             return cap_dict[fname]
-        if os.path.basename(base_no_ext) in cap_dict:
-            return cap_dict[os.path.basename(base_no_ext)]
+        if bname in cap_dict:
+            return cap_dict[bname]
 
     return None
 
 
 def build_merged_token_groups(caption, seq_len):
     """
-    東北大BERTのサブワード（##）を結合して意味の通る単語にまとめ、
-    特殊トークンや句読点・助詞1文字を除いた (表示名, トークンインデックス配列) のリストを返す
+    東北大BERT v3（文字単位トークナイザー）のトークン列を、
+    助詞・句読点・括弧を区切りとして「意味のある単語・フレーズ単位」に分割する。
     """
     tokenizer = get_tokenizer()
     if tokenizer is None or not caption:
-        return [(f"Token[{i}]", [i]) for i in range(min(seq_len, 24))]
+        # キャプションが取得できない場合でも12個のトークン位置を個別に返す
+        return [(f"Token #{i}", [i]) for i in range(1, min(seq_len, 15))]
 
     inputs = tokenizer(
         caption,
@@ -415,32 +505,106 @@ def build_merged_token_groups(caption, seq_len):
     ids = inputs["input_ids"][0].tolist()
     raw_tokens = tokenizer.convert_ids_to_tokens(ids)
 
-    stop_tokens = {
-        "[CLS]", "[SEP]", "[PAD]", "[UNK]",
-        "、", "。", "・", "（", "）", "(", ")", "「", "」", "\n",
-        "の", "に", "を", "は", "が", "と", "で", "や", "も", "へ", "から", "な", "た", "て", "し", "い"
+    # 単語の区切りとなる記号・句読点・1文字助詞
+    delimiters = {
+        "[CLS]",
+        "[SEP]",
+        "[PAD]",
+        "[UNK]",
+        "、",
+        "。",
+        "，",
+        "．",
+        "・",
+        "：",
+        "；",
+        "！",
+        "？",
+        "（",
+        "）",
+        "(",
+        ")",
+        "「",
+        "」",
+        "『",
+        "』",
+        "【",
+        "】",
+        " ",
+        " ",
+        "\n",
+        "\r",
+        "\t",
+        "の",
+        "に",
+        "を",
+        "は",
+        "が",
+        "と",
+        "で",
+        "や",
+        "も",
+        "へ",
+        "な",
+        "た",
+        "て",
+        "し",
     }
 
     groups = []
-    i = 0
-    while i < len(raw_tokens):
-        tok = raw_tokens[i]
+    cur_word = ""
+    cur_idxs = []
+
+    def flush_group():
+        nonlocal cur_word, cur_idxs
+        w = cur_word.strip()
+        if len(w) > 0 and len(cur_idxs) > 0:
+            # 1パネルに収まるよう長すぎるフレーズは6文字ごとに分割
+            if len(w) > 8 and len(cur_idxs) > 6:
+                step = 6
+                for k in range(0, len(cur_idxs), step):
+                    sub_idxs = cur_idxs[k : k + step]
+                    sub_w = w[k : k + step]
+                    if sub_w:
+                        groups.append((sub_w, sub_idxs))
+            else:
+                groups.append((w, cur_idxs))
+        cur_word = ""
+        cur_idxs = []
+
+    for i, tok in enumerate(raw_tokens):
         if tok in ("[CLS]", "[SEP]", "[PAD]"):
-            i += 1
+            flush_group()
             continue
-        word = tok.replace("##", "")
-        idxs = [i]
-        j = i + 1
-        while j < len(raw_tokens) and raw_tokens[j].startswith("##"):
-            word += raw_tokens[j][2:]
-            idxs.append(j)
-            j += 1
-        i = j
 
-        if word not in stop_tokens and len(word.strip()) > 0:
-            groups.append((word, idxs))
+        clean_tok = tok[2:] if tok.startswith("##") else tok
 
-    return groups if groups else [(f"Token[{k}]", [k]) for k in range(min(seq_len, 16))]
+        if clean_tok in delimiters:
+            flush_group()
+            continue
+
+        # 文字種が切り替わるタイミング（漢字・カナ・英数字 ↔ ひらがな等）でも適度に区切る
+        cur_word += clean_tok
+        cur_idxs.append(i)
+
+    flush_group()
+
+    # 万が一分割数が少なすぎる場合は、3トークンずつのチャンクにフォールバック
+    if len(groups) <= 2:
+        groups = []
+        valid = [
+            (i, t.replace("##", ""))
+            for i, t in enumerate(raw_tokens)
+            if t not in ("[CLS]", "[SEP]", "[PAD]")
+        ]
+        for k in range(0, min(len(valid), 36), 3):
+            chunk = valid[k : k + 3]
+            w = "".join(c[1] for c in chunk)
+            idxs = [c[0] for c in chunk]
+            if w.strip():
+                groups.append((w, idxs))
+
+    return groups
 
 
 @torch.no_grad()
@@ -449,11 +613,12 @@ def save_attention_heatmap(
 ):
     """
     代表1枚（denoising_progression.png と同じサンプル）について、
-    どのプロンプト（単語トークン）が画像のどの領域に反応しているかを
-    シルエットが直感的に判別できるオーバーレイ・ヒートマップとして保存する。
+    各単語フレーズが画像のどの領域に反応しているかを並べて可視化する。
     """
     if attn_weights_C is None:
         return
+
+    font_prop = get_japanese_font_prop()
 
     # attn_weights_C: [1, H*W, Seq_Len]
     _, HW, seq_len = attn_weights_C.shape
@@ -473,73 +638,77 @@ def save_attention_heatmap(
     caption = find_caption_for_sample(dataset, ds_idx)
     token_groups = build_merged_token_groups(caption, seq_len)
 
-    # 各単語グループの空間アテンションマップを合成し、反応強度(95パーセンタイル値)を計算
+    # 各単語グループの空間アテンションマップを平均合成し、空間的なコントラスト（標準偏差）とピーク値で評価
     scored_maps = []
     for word, idxs in token_groups:
-        valid_idxs = [ idx for idx in idxs if idx < seq_len ]
+        valid_idxs = [idx for idx in idxs if idx < seq_len]
         if not valid_idxs:
             continue
-        merged_map = attn_map_2d[valid_idxs].sum(dim=0)  # [H, W]
-        # 空間平滑化（3x3 Average Pool）で1ピクセルのスパイクノイズを抑え輪郭を見やすくする
+        # トークン長による有利不利をなくすため mean(dim=0) で合成
+        merged_map = attn_map_2d[valid_idxs].mean(dim=0)  # [H, W]
         smoothed = F.avg_pool2d(
             merged_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
         )[0, 0]
-        score = float(torch.quantile(smoothed.flatten(), 0.95).item())
-        scored_maps.append((score, word, idxs[0], smoothed.cpu().numpy()))
+        # 画面の特定部位に強く反応しているトークン（95%点と中央値の差が大きいもの）を優先選出
+        q95 = float(torch.quantile(smoothed.flatten(), 0.95).item())
+        q50 = float(torch.quantile(smoothed.flatten(), 0.50).item())
+        contrast_score = q95 - q50
+        scored_maps.append((contrast_score, word, idxs[0], smoothed.cpu().numpy()))
 
     if not scored_maps:
         return
 
-    # 反応が強い上位トークンを選択し、プロンプトの出現順に並べ直す
+    # 反応の局在性が高い上位 max_display_tokens 個を選び、プロンプトの出現順に並べる
     scored_maps.sort(key=lambda x: x[0], reverse=True)
     selected = scored_maps[:max_display_tokens]
-    selected.sort(key=lambda x: x[2])  # 元の文章順でソート
+    selected.sort(key=lambda x: x[2])
 
-    # ベースとなる背景画像（シルエットがくっきり見えるよう生成画像の輝度を使用）
     orig_np = orig_vis.permute(1, 2, 0).cpu().numpy()
     gen_np = gen_vis.permute(1, 2, 0).cpu().numpy()
     gen_gray = np.dot(gen_np[..., :3], [0.299, 0.587, 0.114])
     gen_gray_rgb = np.stack([gen_gray] * 3, axis=-1)
 
-    total_panels = 2 + len(selected)  # [Original, Generated] + 各トークン
+    total_panels = 2 + len(
+        selected
+    )  # Original + Generated + 最大14トークン = 最大16パネル (4x4)
     ncols = 4
     nrows = math.ceil(total_panels / ncols)
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 3.4))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 3.6))
     axes = np.array(axes).reshape(-1)
 
-    # パネル0: 元画像
     axes[0].imshow(orig_np)
     axes[0].set_title("Original Image", fontsize=11, fontweight="bold")
     axes[0].axis("off")
 
-    # パネル1: 生成画像
     axes[1].imshow(gen_np)
     axes[1].set_title("Generated (Sample #1)", fontsize=11, fontweight="bold")
     axes[1].axis("off")
 
     cmap = plt.get_cmap("jet")
 
-    # パネル2以降: トークン別オーバーレイヒートマップ
     for idx, (score, word, tok_pos, hmap) in enumerate(selected):
         ax = axes[2 + idx]
-        # トークン内で [0, 1] にMin-Max正規化してコントラストを明確化
-        h_min, h_max = hmap.min(), hmap.max()
+        h_min, h_max = float(hmap.min()), float(hmap.max())
         if h_max - h_min > 1e-8:
             h_norm = (hmap - h_min) / (h_max - h_min)
         else:
             h_norm = np.zeros_like(hmap)
 
-        # 弱い背景反応を抑え、反応部位が画像の輪郭上に浮かび上がるようにガンマ補正
         h_emph = np.power(h_norm, 1.2)
         heat_rgb = cmap(h_emph)[..., :3]
 
-        # 反応が強い場所ほどヒートマップを濃く(最大75%)、弱い場所は背景のグレースケール画像を透かす
         alpha = (0.15 + 0.65 * h_emph)[..., None]
-        blended = np.clip((1.0 - alpha) * (gen_gray_rgb * 0.85) + alpha * heat_rgb, 0.0, 1.0)
+        blended = np.clip(
+            (1.0 - alpha) * (gen_gray_rgb * 0.85) + alpha * heat_rgb, 0.0, 1.0
+        )
 
         ax.imshow(blended)
-        ax.set_title(f"「{word}」\n(peak: {h_max:.3f})", fontsize=10)
+        title_text = f"#{tok_pos}「{word}」\n(peak: {h_max:.3f})"
+        if font_prop is not None:
+            ax.set_title(title_text, fontproperties=font_prop, fontsize=10)
+        else:
+            ax.set_title(title_text, fontsize=10)
         ax.axis("off")
 
     for k in range(total_panels, len(axes)):
@@ -705,7 +874,10 @@ def generate_evaluation_samples(
         orig_aligned = [
             (
                 F.interpolate(
-                    t.unsqueeze(0), size=(grid_h, grid_w), mode="bilinear", align_corners=False
+                    t.unsqueeze(0),
+                    size=(grid_h, grid_w),
+                    mode="bilinear",
+                    align_corners=False,
                 )[0]
                 if t.shape[1:] != (grid_h, grid_w)
                 else t
@@ -715,7 +887,10 @@ def generate_evaluation_samples(
         gen_aligned = [
             (
                 F.interpolate(
-                    t.unsqueeze(0), size=(grid_h, grid_w), mode="bilinear", align_corners=False
+                    t.unsqueeze(0),
+                    size=(grid_h, grid_w),
+                    mode="bilinear",
+                    align_corners=False,
                 )[0]
                 if t.shape[1:] != (grid_h, grid_w)
                 else t
