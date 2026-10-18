@@ -433,30 +433,31 @@ def get_tokenizer():
 
 
 def find_caption_for_sample(dataset, ds_idx):
-    """datasetの属性名に依存せず、ds_idx番目の画像に対応するキャプション文字列を確実に取得する"""
+    """dataset内のあらゆる属性・ディレクトリから ds_idx 番目のキャプション文字列を探索する"""
     img_path = None
 
-    # datasetオブジェクト内のリスト/タプル属性からファイルパスを探索
+    # 1. datasetオブジェクトの全属性からパス文字列を探索
     for attr_name, attr_val in vars(dataset).items():
         if isinstance(attr_val, list) and len(attr_val) > ds_idx:
             elem = attr_val[ds_idx]
-            if isinstance(elem, str) and any(
-                elem.lower().endswith(ext)
-                for ext in (".png", ".jpg", ".jpeg", ".webp", ".pt")
-            ):
+            if isinstance(elem, str):
                 img_path = elem
                 break
-            elif (
-                isinstance(elem, (tuple, list))
-                and len(elem) > 0
-                and isinstance(elem[0], str)
-            ):
-                img_path = elem[0]
-                break
+            elif isinstance(elem, (tuple, list)) and len(elem) > 0:
+                for item in elem:
+                    if isinstance(item, str):
+                        img_path = item
+                        break
+                if img_path:
+                    break
             elif isinstance(elem, dict):
-                for k in ("image_path", "img_path", "image", "path", "pt_path"):
-                    if k in elem and isinstance(elem[k], str):
-                        img_path = elem[k]
+                for v in elem.values():
+                    if isinstance(v, str) and (
+                        "/" in v
+                        or "\\" in v
+                        or v.endswith((".png", ".jpg", ".webp", ".pt"))
+                    ):
+                        img_path = v
                         break
                 if img_path:
                     break
@@ -465,146 +466,112 @@ def find_caption_for_sample(dataset, ds_idx):
         return None
 
     base_no_ext = os.path.splitext(img_path)[0]
-    txt_path = base_no_ext + ".txt"
-    if os.path.exists(txt_path):
-        with open(txt_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
-
     folder = os.path.dirname(img_path)
-    json_path = os.path.join(folder, "captions.json")
-    if os.path.exists(json_path):
-        with open(json_path, "r", encoding="utf-8") as f:
-            cap_dict = json.load(f)
-        fname = os.path.basename(img_path)
-        bname = os.path.basename(base_no_ext)
-        if fname in cap_dict:
-            return cap_dict[fname]
-        if bname in cap_dict:
-            return cap_dict[bname]
+    fname = os.path.basename(img_path)
+    bname = os.path.basename(base_no_ext)
+
+    # 2. 同名の .txt / .caption ファイルを探索
+    for ext in (".txt", ".caption", ".prompt"):
+        cand = base_no_ext + ext
+        if os.path.exists(cand):
+            with open(cand, "r", encoding="utf-8") as f:
+                return f.read().strip()
+
+    # 3. フォルダ内の JSON / CSV / TXT 一覧ファイルを探索
+    for json_name in ("captions.json", "prompts.json", "metadata.json"):
+        json_path = os.path.join(folder, json_name)
+        if os.path.exists(json_path):
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    cap_dict = json.load(f)
+                if isinstance(cap_dict, dict):
+                    for key in (fname, bname, bname.replace("image", "caption")):
+                        if key in cap_dict:
+                            val = cap_dict[key]
+                            return val if isinstance(val, str) else str(val)
+            except Exception:
+                pass
 
     return None
 
 
-def build_merged_token_groups(caption, seq_len):
+def build_individual_token_list(caption, seq_len):
     """
-    東北大BERT v3（文字単位トークナイザー）のトークン列を、
-    助詞・句読点・括弧を区切りとして「意味のある単語・フレーズ単位」に分割する。
+    複数トークンの結合を行わず、各トークンを 1対1 で個別リスト化する。
+    戻り値: [(表示ラベル, トークンインデックス), ...]
     """
     tokenizer = get_tokenizer()
-    if tokenizer is None or not caption:
-        # キャプションが取得できない場合でも12個のトークン位置を個別に返す
-        return [(f"Token #{i}", [i]) for i in range(1, min(seq_len, 15))]
 
-    inputs = tokenizer(
-        caption,
-        return_tensors="pt",
-        padding="max_length",
-        max_length=seq_len,
-        truncation=True,
-    )
-    ids = inputs["input_ids"][0].tolist()
-    raw_tokens = tokenizer.convert_ids_to_tokens(ids)
+    # キャプション文字列が取得できた場合はトークナイズして個別トークン名を付与
+    if tokenizer is not None and caption:
+        inputs = tokenizer(
+            caption,
+            return_tensors="pt",
+            padding="max_length",
+            max_length=seq_len,
+            truncation=True,
+        )
+        ids = inputs["input_ids"][0].tolist()
+        raw_tokens = tokenizer.convert_ids_to_tokens(ids)
 
-    # 単語の区切りとなる記号・句読点・1文字助詞
-    delimiters = {
-        "[CLS]",
-        "[SEP]",
-        "[PAD]",
-        "[UNK]",
-        "、",
-        "。",
-        "，",
-        "．",
-        "・",
-        "：",
-        "；",
-        "！",
-        "？",
-        "（",
-        "）",
-        "(",
-        ")",
-        "「",
-        "」",
-        "『",
-        "』",
-        "【",
-        "】",
-        " ",
-        " ",
-        "\n",
-        "\r",
-        "\t",
-        "の",
-        "に",
-        "を",
-        "は",
-        "が",
-        "と",
-        "で",
-        "や",
-        "も",
-        "へ",
-        "な",
-        "た",
-        "て",
-        "し",
-    }
+        skip_set = {
+            "[CLS]",
+            "[SEP]",
+            "[PAD]",
+            "[UNK]",
+            "、",
+            "。",
+            "，",
+            "．",
+            "・",
+            "：",
+            "；",
+            "！",
+            "？",
+            "（",
+            "）",
+            "(",
+            ")",
+            "「",
+            "」",
+            "『",
+            "』",
+            "【",
+            "】",
+            "の",
+            "に",
+            "を",
+            "は",
+            "が",
+            "と",
+            "で",
+            "や",
+            "も",
+            "へ",
+            "な",
+            "た",
+            "て",
+            "し",
+        }
 
-    groups = []
-    cur_word = ""
-    cur_idxs = []
+        token_list = []
+        for i, tok in enumerate(raw_tokens):
+            if i >= seq_len:
+                break
+            if tok in ("[CLS]", "[SEP]", "[PAD]"):
+                continue
+            clean_tok = tok[2:] if tok.startswith("##") else tok
+            if clean_tok in skip_set or len(clean_tok.strip()) == 0:
+                continue
+            token_list.append((clean_tok, i))
 
-    def flush_group():
-        nonlocal cur_word, cur_idxs
-        w = cur_word.strip()
-        if len(w) > 0 and len(cur_idxs) > 0:
-            # 1パネルに収まるよう長すぎるフレーズは6文字ごとに分割
-            if len(w) > 8 and len(cur_idxs) > 6:
-                step = 6
-                for k in range(0, len(cur_idxs), step):
-                    sub_idxs = cur_idxs[k : k + step]
-                    sub_w = w[k : k + step]
-                    if sub_w:
-                        groups.append((sub_w, sub_idxs))
-            else:
-                groups.append((w, cur_idxs))
-        cur_word = ""
-        cur_idxs = []
+        if len(token_list) >= 2:
+            return token_list
 
-    for i, tok in enumerate(raw_tokens):
-        if tok in ("[CLS]", "[SEP]", "[PAD]"):
-            flush_group()
-            continue
-
-        clean_tok = tok[2:] if tok.startswith("##") else tok
-
-        if clean_tok in delimiters:
-            flush_group()
-            continue
-
-        # 文字種が切り替わるタイミング（漢字・カナ・英数字 ↔ ひらがな等）でも適度に区切る
-        cur_word += clean_tok
-        cur_idxs.append(i)
-
-    flush_group()
-
-    # 万が一分割数が少なすぎる場合は、3トークンずつのチャンクにフォールバック
-    if len(groups) <= 2:
-        groups = []
-        valid = [
-            (i, t.replace("##", ""))
-            for i, t in enumerate(raw_tokens)
-            if t not in ("[CLS]", "[SEP]", "[PAD]")
-        ]
-        for k in range(0, min(len(valid), 36), 3):
-            chunk = valid[k : k + 3]
-            w = "".join(c[1] for c in chunk)
-            idxs = [c[0] for c in chunk]
-            if w.strip():
-                groups.append((w, idxs))
-
-    return groups
+    # キャプションファイルが無い場合、またはトークンが1つ以下になった場合は
+    # seq_len の各インデックスを1つずつ個別トークンとして返す
+    num_fallback = min(seq_len, 14)
+    return [(f"Token #{i}", i) for i in range(num_fallback)]
 
 
 @torch.no_grad()
@@ -613,9 +580,10 @@ def save_attention_heatmap(
 ):
     """
     代表1枚（denoising_progression.png と同じサンプル）について、
-    各単語フレーズが画像のどの領域に反応しているかを並べて可視化する。
+    個々のトークンごとの Cross-Attention ヒートマップを並べて保存する。
     """
     if attn_weights_C is None:
+        print("Warning: [Heatmap] attn_weights_C が取得できませんでした。")
         return
 
     font_prop = get_japanese_font_prop()
@@ -623,6 +591,13 @@ def save_attention_heatmap(
     # attn_weights_C: [1, H*W, Seq_Len]
     _, HW, seq_len = attn_weights_C.shape
     _, H, W = gen_vis.shape
+
+    # 万が一 context のトークン長自体が 1 の場合は警告を出す
+    if seq_len <= 1:
+        print(
+            f"Warning: [Heatmap] 入力テキストテンソル(.pt)のトークン長(seq_len)が {seq_len} しかありません！"
+            f" 全トークンで空間全体の平均しか計算できないため、prepare_text.py の出力形状を確認してください。"
+        )
 
     attn_map_2d = attn_weights_C[0].transpose(0, 1).contiguous()  # [Seq_Len, H*W]
     if HW == H * W:
@@ -636,41 +611,44 @@ def save_attention_heatmap(
         )[0]
 
     caption = find_caption_for_sample(dataset, ds_idx)
-    token_groups = build_merged_token_groups(caption, seq_len)
+    token_items = build_individual_token_list(caption, seq_len)
 
-    # 各単語グループの空間アテンションマップを平均合成し、空間的なコントラスト（標準偏差）とピーク値で評価
     scored_maps = []
-    for word, idxs in token_groups:
-        valid_idxs = [idx for idx in idxs if idx < seq_len]
-        if not valid_idxs:
+    for word, tok_idx in token_items:
+        if tok_idx >= seq_len:
             continue
-        # トークン長による有利不利をなくすため mean(dim=0) で合成
-        merged_map = attn_map_2d[valid_idxs].mean(dim=0)  # [H, W]
+        single_map = attn_map_2d[
+            tok_idx
+        ]  # [H, W] (結合せず単一トークンのマップをそのまま使用)
         smoothed = F.avg_pool2d(
-            merged_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
+            single_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
         )[0, 0]
-        # 画面の特定部位に強く反応しているトークン（95%点と中央値の差が大きいもの）を優先選出
+
+        # ほとんどゼロのパディング領域を除外するためピークとコントラストでスコア化
         q95 = float(torch.quantile(smoothed.flatten(), 0.95).item())
         q50 = float(torch.quantile(smoothed.flatten(), 0.50).item())
-        contrast_score = q95 - q50
-        scored_maps.append((contrast_score, word, idxs[0], smoothed.cpu().numpy()))
+        contrast_score = (q95 - q50) + 0.1 * q95
+        scored_maps.append((contrast_score, word, tok_idx, smoothed.cpu().numpy()))
 
     if not scored_maps:
         return
 
-    # 反応の局在性が高い上位 max_display_tokens 個を選び、プロンプトの出現順に並べる
+    # 反応が明確な上位 max_display_tokens 個を選出し、トークン番号順にソート
     scored_maps.sort(key=lambda x: x[0], reverse=True)
     selected = scored_maps[:max_display_tokens]
     selected.sort(key=lambda x: x[2])
+
+    print(
+        f"  -> [Heatmap] seq_len={seq_len} | caption_found={caption is not None} | "
+        f"displaying {len(selected)} token panels"
+    )
 
     orig_np = orig_vis.permute(1, 2, 0).cpu().numpy()
     gen_np = gen_vis.permute(1, 2, 0).cpu().numpy()
     gen_gray = np.dot(gen_np[..., :3], [0.299, 0.587, 0.114])
     gen_gray_rgb = np.stack([gen_gray] * 3, axis=-1)
 
-    total_panels = 2 + len(
-        selected
-    )  # Original + Generated + 最大14トークン = 最大16パネル (4x4)
+    total_panels = 2 + len(selected)
     ncols = 4
     nrows = math.ceil(total_panels / ncols)
 
