@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import copy
 import csv
 import math
@@ -8,6 +9,7 @@ import random
 import argparse
 from datetime import datetime
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -19,9 +21,44 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.font_manager as fm
 
 from models.luan.model import TripleStreamModel
 from dataset import VisualDataset, AspectRatioBatchSampler
+
+
+def setup_japanese_font():
+    """matplotlibで日本語トークンが文字化けしないよう利用可能なフォントを自動設定する"""
+    candidates = [
+        "Noto Sans CJK JP",
+        "IPAGothic",
+        "IPAPGothic",
+        "Yu Gothic",
+        "Meiryo",
+        "Hiragino Sans",
+        "MS Gothic",
+    ]
+    available_fonts = {f.name for f in fm.fontManager.ttflist}
+    for font in candidates:
+        if font in available_fonts:
+            plt.rcParams["font.sans-serif"] = [font]
+            plt.rcParams["axes.unicode_minus"] = False
+            return
+    # Colab等のLinux環境でフォントパスを直接探索
+    linux_font_paths = [
+        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    ]
+    for path in linux_font_paths:
+        if os.path.exists(path):
+            fm.fontManager.addfont(path)
+            prop = fm.FontProperties(fname=path)
+            plt.rcParams["font.sans-serif"] = [prop.get_name()]
+            plt.rcParams["axes.unicode_minus"] = False
+            return
+
+
+setup_japanese_font()
 
 
 class EMAModel:
@@ -42,7 +79,6 @@ class EMAModel:
 
 
 def parse_resolution(res_str):
-    """'128' -> (128, 128), '128x192' -> (128, 192) のように解像度文字列をパースする"""
     if res_str is None or res_str.strip() == "":
         return None
     res_str = res_str.lower().strip()
@@ -54,7 +90,6 @@ def parse_resolution(res_str):
 
 
 def parse_auto_int(val):
-    """引数に None / 'auto' / 0 以下が渡された場合は自動決定モード(None)にする"""
     if val is None:
         return None
     if isinstance(val, str):
@@ -66,26 +101,10 @@ def parse_auto_int(val):
 
 
 def round_to_nice_step(val):
-    """数値を 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000... のキリの良い間隔に丸める"""
     if val <= 1:
         return 1
     nice_steps = [
-        1,
-        2,
-        5,
-        10,
-        20,
-        25,
-        50,
-        100,
-        200,
-        250,
-        500,
-        1000,
-        2000,
-        2500,
-        5000,
-        10000,
+        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000
     ]
     for s in nice_steps:
         if val <= s:
@@ -94,46 +113,28 @@ def round_to_nice_step(val):
 
 
 def estimate_target_iterations(dataset, batch_size, timesteps=1000):
-    """
-    データセットの枚数・割り当てバケットの平均ピクセル数・バッチサイズ・タイムステップ数から
-    収束に必要な目標イテレーション数を自動算出する。
-    """
     num_images = max(1, len(dataset))
-
     total_pixels = sum(
         h * w * len(indices) for (h, w), indices in dataset.bucket_to_indices.items()
     )
     avg_pixels = total_pixels / num_images if total_pixels > 0 else 256 * 256
-
     area_ratio = avg_pixels / (128.0 * 128.0)
     res_factor = max(1.0, area_ratio**0.35)
-
     base_iters_128 = 35000.0 + 9000.0 * math.sqrt(num_images)
     batch_factor = (2.0 / max(1, batch_size)) ** 0.25
     timestep_factor = (timesteps / 1000.0) ** 0.5
-
     raw_iters = base_iters_128 * res_factor * batch_factor * timestep_factor
-    target_iters = max(20000, int(round(raw_iters / 5000.0)) * 5000)
-    return target_iters
+    return max(20000, int(round(raw_iters / 5000.0)) * 5000)
 
 
 def estimate_save_every_epochs(epochs, iters_per_epoch):
-    """
-    全学習工程で約20〜25回のチェックポイント保存（または約4,000イテレーション間隔）
-    になるよう保存エポック間隔を自動決定する。
-    """
     total_iters = epochs * iters_per_epoch
-    # 全工程で20〜25回程度、かつ1回あたり2,500〜5,000イテレーション程度を目安にする
     target_ckpt_count = min(25, max(10, total_iters // 4000))
     raw_epochs = max(1, epochs / max(1, target_ckpt_count))
     return min(epochs, round_to_nice_step(raw_epochs))
 
 
 def estimate_log_every_epochs(epochs, iters_per_epoch, save_every_epochs):
-    """
-    チェックポイント保存時以外にターミナルへ進捗を表示するエポック間隔を自動決定する。
-    （約100〜200イテレーションごと、またはチェックポイント間隔の約1/10）
-    """
     by_iters = max(1, round(150.0 / max(1, iters_per_epoch)))
     by_save = max(1, save_every_epochs // 10)
     raw_log = min(by_iters, by_save)
@@ -141,7 +142,6 @@ def estimate_log_every_epochs(epochs, iters_per_epoch, save_every_epochs):
 
 
 def format_duration(seconds):
-    """秒数を HH:MM:SS 形式の文字列に変換する"""
     seconds = max(0, int(round(seconds)))
     h, rem = divmod(seconds, 3600)
     m, s = divmod(rem, 60)
@@ -149,15 +149,63 @@ def format_duration(seconds):
 
 
 def get_cosine_alpha_cumprod(t, max_steps=1000, s=0.008):
-    """特異点を回避するためのオフセット付きコサインスケジュール"""
     t_norm = t.float() / max_steps
     f_t = torch.cos((t_norm + s) / (1.0 + s) * math.pi / 2) ** 2
     f_0 = torch.cos(torch.tensor(s / (1.0 + s) * math.pi / 2, device=t.device)) ** 2
     return f_t / f_0
 
 
+# =====================================================================
+# 追加評価指標: PSNR / SSIM の計算関数 (値域 [0.0, 1.0] の画像テンソル対象)
+# =====================================================================
+@torch.no_grad()
+def compute_psnr(img1, img2):
+    """[C, H, W] または [B, C, H, W] (値域 0〜1) のPSNR(dB)を算出"""
+    mse = F.mse_loss(img1, img2).item()
+    if mse < 1e-10:
+        return 50.0
+    return 10.0 * math.log10(1.0 / mse)
+
+
+@torch.no_grad()
+def compute_ssim(img1, img2, window_size=11):
+    """[1, C, H, W] (値域 0〜1) のSSIM (0〜1) をガウシアン窓で算出"""
+    if img1.dim() == 3:
+        img1 = img1.unsqueeze(0)
+    if img2.dim() == 3:
+        img2 = img2.unsqueeze(0)
+
+    C = img1.size(1)
+    coords = torch.arange(window_size, dtype=img1.dtype, device=img1.device) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * 1.5 ** 2))
+    g = g / g.sum()
+    window = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
+    window = window.expand(C, 1, window_size, window_size).contiguous()
+
+    pad = window_size // 2
+    mu1 = F.conv2d(img1, window, padding=pad, groups=C)
+    mu2 = F.conv2d(img2, window, padding=pad, groups=C)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=pad, groups=C) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=C) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / (
+        (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
+    )
+    return float(ssim_map.mean().item())
+
+
+# =====================================================================
+# CSV読み書き & 3段グラフ描画 (Loss / Grad Norm / PSNR & SSIM)
+# =====================================================================
 def load_metrics_csv(csv_path):
-    """既存の metrics.csv から履歴リストを復元する"""
     history = []
     if not os.path.exists(csv_path):
         return history
@@ -169,21 +217,45 @@ def load_metrics_csv(csv_path):
                     "epoch": int(row["epoch"]),
                     "iteration": int(row["iteration"]),
                     "loss": float(row["loss"]),
+                    "mse_loss": float(row.get("mse_loss", row["loss"])),
+                    "l1_loss": float(row.get("l1_loss", row["loss"])),
                     "grad_A": float(row["grad_norm_A"]),
                     "grad_B": float(row["grad_norm_B"]),
                     "grad_C": float(row["grad_norm_C"]),
+                    "lr": float(row.get("lr", 0.0)),
+                    "eval_psnr": (
+                        float(row["eval_psnr"])
+                        if row.get("eval_psnr") not in (None, "", "None")
+                        else None
+                    ),
+                    "eval_ssim": (
+                        float(row["eval_ssim"])
+                        if row.get("eval_ssim") not in (None, "", "None")
+                        else None
+                    ),
                 }
             )
     return history
 
 
 def save_metrics_csv_and_plot(metrics_history, save_dir):
-    """これまでの各種指標の推移をCSVと対数グラフ画像として保存"""
     csv_path = os.path.join(save_dir, "metrics.csv")
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["epoch", "iteration", "loss", "grad_norm_A", "grad_norm_B", "grad_norm_C"]
+            [
+                "epoch",
+                "iteration",
+                "loss",
+                "mse_loss",
+                "l1_loss",
+                "grad_norm_A",
+                "grad_norm_B",
+                "grad_norm_C",
+                "lr",
+                "eval_psnr",
+                "eval_ssim",
+            ]
         )
         for row in metrics_history:
             writer.writerow(
@@ -191,43 +263,74 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
                     row["epoch"],
                     row["iteration"],
                     f"{row['loss']:.6f}",
+                    f"{row.get('mse_loss', row['loss']):.6f}",
+                    f"{row.get('l1_loss', row['loss']):.6f}",
                     f"{row['grad_A']:.6f}",
                     f"{row['grad_B']:.6f}",
                     f"{row['grad_C']:.6f}",
+                    f"{row.get('lr', 0.0):.2e}",
+                    f"{row['eval_psnr']:.2f}" if row.get("eval_psnr") is not None else "",
+                    f"{row['eval_ssim']:.4f}" if row.get("eval_ssim") is not None else "",
                 ]
             )
 
     epochs = [row["epoch"] for row in metrics_history]
     losses = [max(row["loss"], 1e-7) for row in metrics_history]
+    mse_losses = [max(row.get("mse_loss", row["loss"]), 1e-7) for row in metrics_history]
+    l1_losses = [max(row.get("l1_loss", row["loss"]), 1e-7) for row in metrics_history]
     grad_A = [max(row["grad_A"], 1e-8) for row in metrics_history]
     grad_B = [max(row["grad_B"], 1e-8) for row in metrics_history]
     grad_C = [max(row["grad_C"], 1e-8) for row in metrics_history]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    eval_pts = [
+        (row["epoch"], row["eval_psnr"], row["eval_ssim"])
+        for row in metrics_history
+        if row.get("eval_psnr") is not None and row.get("eval_ssim") is not None
+    ]
 
-    ax1.plot(
-        epochs,
-        losses,
-        label="Min-SNR Weighted Hybrid Loss",
-        color="tab:red",
-        linewidth=1.2,
-    )
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(11, 11), sharex=True)
+
+    # 1段目: Hybrid Loss / Raw MSE / Raw L1
+    ax1.plot(epochs, losses, label="Min-SNR Hybrid Loss", color="tab:red", linewidth=1.2)
+    ax1.plot(epochs, l1_losses, label="Raw L1 (Edge/Detail)", color="tab:purple", alpha=0.6, linewidth=0.9)
+    ax1.plot(epochs, mse_losses, label="Raw MSE (Global Color)", color="tab:brown", alpha=0.6, linewidth=0.9)
     ax1.set_yscale("log")
     ax1.set_ylabel("Loss (Log Scale)")
-    ax1.set_title("Training Loss & Gradient Norms History")
+    ax1.set_title("Training Losses, Stream Gradient Norms & Image Quality Metrics")
     ax1.grid(True, linestyle="--", alpha=0.6)
-    ax1.legend()
+    ax1.legend(loc="upper right")
 
+    # 2段目: Stream A / B / C 勾配ノルム
     ax2.plot(epochs, grad_A, label="Stream A (Global)", color="tab:blue", alpha=0.8)
-    ax2.plot(
-        epochs, grad_B, label="Stream B (Relational)", color="tab:green", alpha=0.8
-    )
+    ax2.plot(epochs, grad_B, label="Stream B (Relational)", color="tab:green", alpha=0.8)
     ax2.plot(epochs, grad_C, label="Stream C (Texture)", color="tab:orange", alpha=0.8)
     ax2.set_yscale("log")
-    ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Grad Norm (Log Scale)")
     ax2.grid(True, linestyle="--", alpha=0.6)
-    ax2.legend()
+    ax2.legend(loc="upper right")
+
+    # 3段目: 推論画像の画質評価指標 (PSNR & SSIM)
+    ax3_right = ax3.twinx()
+    if eval_pts:
+        ev_epochs = [p[0] for p in eval_pts]
+        ev_psnr = [p[1] for p in eval_pts]
+        ev_ssim = [p[2] for p in eval_pts]
+
+        l1 = ax3.plot(
+            ev_epochs, ev_psnr, marker="o", color="tab:cyan", linewidth=1.5, label="Eval PSNR (dB)"
+        )
+        l2 = ax3_right.plot(
+            ev_epochs, ev_ssim, marker="s", color="tab:pink", linewidth=1.5, linestyle="--", label="Eval SSIM"
+        )
+        lines = l1 + l2
+        labels = [l.get_label() for l in lines]
+        ax3.legend(lines, labels, loc="lower right")
+
+    ax3.set_xlabel("Epoch")
+    ax3.set_ylabel("PSNR (dB)", color="tab:cyan")
+    ax3_right.set_ylabel("SSIM (0.0 - 1.0)", color="tab:pink")
+    ax3_right.set_ylim(0.0, 1.05)
+    ax3.grid(True, linestyle="--", alpha=0.6)
 
     plt.tight_layout()
     plot_path = os.path.join(save_dir, "metrics_plot.png")
@@ -235,15 +338,241 @@ def save_metrics_csv_and_plot(metrics_history, save_dir):
     plt.close(fig)
 
 
-def ddim_sample_batch(
-    model, contexts, shape, device, max_steps=1000, capture_steps=None
+# =====================================================================
+# プロンプト文字列・トークン復元 & Cross-Attention ヒートマップ生成
+# =====================================================================
+_CACHED_TOKENIZER = None
+
+
+def get_tokenizer():
+    global _CACHED_TOKENIZER
+    if _CACHED_TOKENIZER is None:
+        try:
+            from transformers import AutoTokenizer
+            _CACHED_TOKENIZER = AutoTokenizer.from_pretrained(
+                "cl-tohoku/bert-base-japanese-v3"
+            )
+        except Exception as e:
+            print(f"Warning: トークナイザーの読み込みをスキップしました ({e})")
+            _CACHED_TOKENIZER = False
+    return _CACHED_TOKENIZER if _CACHED_TOKENIZER is not False else None
+
+
+def find_caption_for_sample(dataset, ds_idx):
+    """datasetのサンプルインデックスから対応する元キャプション文字列を取得する"""
+    img_path = None
+    for attr in ("samples", "image_paths", "files", "data"):
+        if hasattr(dataset, attr):
+            item = getattr(dataset, attr)[ds_idx]
+            if isinstance(item, str):
+                img_path = item
+            elif isinstance(item, (tuple, list)) and len(item) > 0:
+                img_path = item[0]
+            elif isinstance(item, dict):
+                img_path = item.get("image_path") or item.get("image") or item.get("path")
+            break
+
+    if img_path is None or not isinstance(img_path, str):
+        return None
+
+    base_no_ext = os.path.splitext(img_path)[0]
+    txt_path = base_no_ext + ".txt"
+    if os.path.exists(txt_path):
+        with open(txt_path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+
+    # captions.json がある場合のフォールバック
+    folder = os.path.dirname(img_path)
+    json_path = os.path.join(folder, "captions.json")
+    if os.path.exists(json_path):
+        with open(json_path, "r", encoding="utf-8") as f:
+            cap_dict = json.load(f)
+        fname = os.path.basename(img_path)
+        if fname in cap_dict:
+            return cap_dict[fname]
+        if os.path.basename(base_no_ext) in cap_dict:
+            return cap_dict[os.path.basename(base_no_ext)]
+
+    return None
+
+
+def build_merged_token_groups(caption, seq_len):
+    """
+    東北大BERTのサブワード（##）を結合して意味の通る単語にまとめ、
+    特殊トークンや句読点・助詞1文字を除いた (表示名, トークンインデックス配列) のリストを返す
+    """
+    tokenizer = get_tokenizer()
+    if tokenizer is None or not caption:
+        return [(f"Token[{i}]", [i]) for i in range(min(seq_len, 24))]
+
+    inputs = tokenizer(
+        caption,
+        return_tensors="pt",
+        padding="max_length",
+        max_length=seq_len,
+        truncation=True,
+    )
+    ids = inputs["input_ids"][0].tolist()
+    raw_tokens = tokenizer.convert_ids_to_tokens(ids)
+
+    stop_tokens = {
+        "[CLS]", "[SEP]", "[PAD]", "[UNK]",
+        "、", "。", "・", "（", "）", "(", ")", "「", "」", "\n",
+        "の", "に", "を", "は", "が", "と", "で", "や", "も", "へ", "から", "な", "た", "て", "し", "い"
+    }
+
+    groups = []
+    i = 0
+    while i < len(raw_tokens):
+        tok = raw_tokens[i]
+        if tok in ("[CLS]", "[SEP]", "[PAD]"):
+            i += 1
+            continue
+        word = tok.replace("##", "")
+        idxs = [i]
+        j = i + 1
+        while j < len(raw_tokens) and raw_tokens[j].startswith("##"):
+            word += raw_tokens[j][2:]
+            idxs.append(j)
+            j += 1
+        i = j
+
+        if word not in stop_tokens and len(word.strip()) > 0:
+            groups.append((word, idxs))
+
+    return groups if groups else [(f"Token[{k}]", [k]) for k in range(min(seq_len, 16))]
+
+
+@torch.no_grad()
+def save_attention_heatmap(
+    orig_vis, gen_vis, attn_weights_C, dataset, ds_idx, save_dir, max_display_tokens=14
 ):
     """
-    DDIM (eta=0) 決定論的サンプラーにより、任意の解像度 shape=(B, C, H, W) で画像を生成する
+    代表1枚（denoising_progression.png と同じサンプル）について、
+    どのプロンプト（単語トークン）が画像のどの領域に反応しているかを
+    シルエットが直感的に判別できるオーバーレイ・ヒートマップとして保存する。
     """
+    if attn_weights_C is None:
+        return
+
+    # attn_weights_C: [1, H*W, Seq_Len]
+    _, HW, seq_len = attn_weights_C.shape
+    _, H, W = gen_vis.shape
+
+    attn_map_2d = attn_weights_C[0].transpose(0, 1).contiguous()  # [Seq_Len, H*W]
+    if HW == H * W:
+        attn_map_2d = attn_map_2d.view(seq_len, H, W)
+    else:
+        side_h = int(round(math.sqrt(HW * H / W)))
+        side_w = max(1, HW // max(1, side_h))
+        attn_map_2d = attn_map_2d.view(1, seq_len, side_h, side_w)
+        attn_map_2d = F.interpolate(
+            attn_map_2d, size=(H, W), mode="bilinear", align_corners=False
+        )[0]
+
+    caption = find_caption_for_sample(dataset, ds_idx)
+    token_groups = build_merged_token_groups(caption, seq_len)
+
+    # 各単語グループの空間アテンションマップを合成し、反応強度(95パーセンタイル値)を計算
+    scored_maps = []
+    for word, idxs in token_groups:
+        valid_idxs = [ idx for idx in idxs if idx < seq_len ]
+        if not valid_idxs:
+            continue
+        merged_map = attn_map_2d[valid_idxs].sum(dim=0)  # [H, W]
+        # 空間平滑化（3x3 Average Pool）で1ピクセルのスパイクノイズを抑え輪郭を見やすくする
+        smoothed = F.avg_pool2d(
+            merged_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
+        )[0, 0]
+        score = float(torch.quantile(smoothed.flatten(), 0.95).item())
+        scored_maps.append((score, word, idxs[0], smoothed.cpu().numpy()))
+
+    if not scored_maps:
+        return
+
+    # 反応が強い上位トークンを選択し、プロンプトの出現順に並べ直す
+    scored_maps.sort(key=lambda x: x[0], reverse=True)
+    selected = scored_maps[:max_display_tokens]
+    selected.sort(key=lambda x: x[2])  # 元の文章順でソート
+
+    # ベースとなる背景画像（シルエットがくっきり見えるよう生成画像の輝度を使用）
+    orig_np = orig_vis.permute(1, 2, 0).cpu().numpy()
+    gen_np = gen_vis.permute(1, 2, 0).cpu().numpy()
+    gen_gray = np.dot(gen_np[..., :3], [0.299, 0.587, 0.114])
+    gen_gray_rgb = np.stack([gen_gray] * 3, axis=-1)
+
+    total_panels = 2 + len(selected)  # [Original, Generated] + 各トークン
+    ncols = 4
+    nrows = math.ceil(total_panels / ncols)
+
+    fig, axes = plt.subplots(nrows, ncols, figsize=(ncols * 3.2, nrows * 3.4))
+    axes = np.array(axes).reshape(-1)
+
+    # パネル0: 元画像
+    axes[0].imshow(orig_np)
+    axes[0].set_title("Original Image", fontsize=11, fontweight="bold")
+    axes[0].axis("off")
+
+    # パネル1: 生成画像
+    axes[1].imshow(gen_np)
+    axes[1].set_title("Generated (Sample #1)", fontsize=11, fontweight="bold")
+    axes[1].axis("off")
+
+    cmap = plt.get_cmap("jet")
+
+    # パネル2以降: トークン別オーバーレイヒートマップ
+    for idx, (score, word, tok_pos, hmap) in enumerate(selected):
+        ax = axes[2 + idx]
+        # トークン内で [0, 1] にMin-Max正規化してコントラストを明確化
+        h_min, h_max = hmap.min(), hmap.max()
+        if h_max - h_min > 1e-8:
+            h_norm = (hmap - h_min) / (h_max - h_min)
+        else:
+            h_norm = np.zeros_like(hmap)
+
+        # 弱い背景反応を抑え、反応部位が画像の輪郭上に浮かび上がるようにガンマ補正
+        h_emph = np.power(h_norm, 1.2)
+        heat_rgb = cmap(h_emph)[..., :3]
+
+        # 反応が強い場所ほどヒートマップを濃く(最大75%)、弱い場所は背景のグレースケール画像を透かす
+        alpha = (0.15 + 0.65 * h_emph)[..., None]
+        blended = np.clip((1.0 - alpha) * (gen_gray_rgb * 0.85) + alpha * heat_rgb, 0.0, 1.0)
+
+        ax.imshow(blended)
+        ax.set_title(f"「{word}」\n(peak: {h_max:.3f})", fontsize=10)
+        ax.axis("off")
+
+    for k in range(total_panels, len(axes)):
+        axes[k].axis("off")
+
+    plt.suptitle(
+        "Stream C Cross-Attention Heatmap per Prompt Token (Sample #1)",
+        fontsize=13,
+        fontweight="bold",
+        y=0.99,
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
+    heatmap_path = os.path.join(save_dir, "attention_heatmap.png")
+    plt.savefig(heatmap_path, dpi=150)
+    plt.close(fig)
+
+
+# =====================================================================
+# DDIM サンプラー（最終ステップでの Cross-Attention フック取得に対応）
+# =====================================================================
+def ddim_sample_batch(
+    model,
+    contexts,
+    shape,
+    device,
+    max_steps=1000,
+    capture_steps=None,
+    capture_final_attn=False,
+):
     B, C, H, W = shape
     x = torch.randn(shape, device=device)
     progression_tensors = []
+    final_attn_weights = None
 
     for i in reversed(range(max_steps)):
         t = torch.full((B,), i, device=device, dtype=torch.long)
@@ -259,7 +588,27 @@ def ddim_sample_batch(
         else:
             alpha_cumprod_t_prev = torch.ones((B, 1, 1, 1), device=device)
 
-        predicted_x0 = model(x, contexts, t)
+        # 最終ステップ (i == 0) で Stream C の Cross-Attention 重みをキャプチャ
+        if capture_final_attn and i == 0 and hasattr(model, "cross_attn_C"):
+            captured = {}
+            orig_forward = model.cross_attn_C.forward
+
+            def hooked_forward(query, key, value, *args, **kwargs):
+                kwargs["need_weights"] = True
+                kwargs["average_attn_weights"] = True
+                out, weights = orig_forward(query, key, value, *args, **kwargs)
+                captured["weights"] = weights.detach().cpu()
+                return out, weights
+
+            model.cross_attn_C.forward = hooked_forward
+            try:
+                predicted_x0 = model(x, contexts, t)
+            finally:
+                model.cross_attn_C.forward = orig_forward
+            final_attn_weights = captured.get("weights", None)
+        else:
+            predicted_x0 = model(x, contexts, t)
+
         predicted_x0 = torch.clamp(predicted_x0, -1.0, 1.0)
 
         if i > 0:
@@ -278,7 +627,7 @@ def ddim_sample_batch(
             step_img = torch.clamp((x[0].detach().cpu() + 1.0) / 2.0, 0.0, 1.0)
             progression_tensors.append(step_img)
 
-    return x, progression_tensors
+    return x, progression_tensors, final_attn_weights
 
 
 def generate_evaluation_samples(
@@ -286,8 +635,10 @@ def generate_evaluation_samples(
 ):
     """
     データセットからランダムに3つ選び:
-    1. comparison_grid.png
-    2. denoising_progression.png
+    1. comparison_grid.png (上段: 元画像3枚, 下段: 生成画像3枚)
+    2. denoising_progression.png (代表1枚目: ステップ毎の推移)
+    3. attention_heatmap.png (代表1枚目: トークン毎のCross-Attentionヒートマップ)
+    を生成し、3枚の平均 PSNR と SSIM を返す。
     """
     model.eval()
     num_samples = 3
@@ -305,6 +656,9 @@ def generate_evaluation_samples(
     orig_vis_list = []
     gen_vis_list = []
     progression_tensors = []
+    rep_attn_weights = None
+    psnr_list = []
+    ssim_list = []
 
     with torch.no_grad():
         for s_idx, ds_idx in enumerate(indices):
@@ -321,32 +675,37 @@ def generate_evaluation_samples(
                 _, _, target_h, target_w = img.shape
                 orig_resized = img
 
-            c_steps = capture_steps if s_idx == 0 else None
-            gen_x, prog = ddim_sample_batch(
+            is_rep = s_idx == 0
+            gen_x, prog, attn_w = ddim_sample_batch(
                 model,
                 ctx,
                 shape=(1, 3, target_h, target_w),
                 device=device,
                 max_steps=max_steps,
-                capture_steps=c_steps,
+                capture_steps=capture_steps if is_rep else None,
+                capture_final_attn=is_rep,
             )
 
-            if s_idx == 0:
+            orig_vis = torch.clamp((orig_resized[0].cpu() + 1.0) / 2.0, 0.0, 1.0)
+            gen_vis = torch.clamp((gen_x[0].cpu() + 1.0) / 2.0, 0.0, 1.0)
+
+            orig_vis_list.append(orig_vis)
+            gen_vis_list.append(gen_vis)
+
+            # PSNR / SSIM の算出
+            psnr_list.append(compute_psnr(orig_vis, gen_vis))
+            ssim_list.append(compute_ssim(orig_vis, gen_vis))
+
+            if is_rep:
                 progression_tensors = prog
+                rep_attn_weights = attn_w
 
-            orig_vis_list.append(
-                torch.clamp((orig_resized[0].cpu() + 1.0) / 2.0, 0.0, 1.0)
-            )
-            gen_vis_list.append(torch.clamp((gen_x[0].cpu() + 1.0) / 2.0, 0.0, 1.0))
-
+        # 1. comparison_grid.png の保存
         grid_h, grid_w = orig_vis_list[0].shape[1], orig_vis_list[0].shape[2]
         orig_aligned = [
             (
                 F.interpolate(
-                    t.unsqueeze(0),
-                    size=(grid_h, grid_w),
-                    mode="bilinear",
-                    align_corners=False,
+                    t.unsqueeze(0), size=(grid_h, grid_w), mode="bilinear", align_corners=False
                 )[0]
                 if t.shape[1:] != (grid_h, grid_w)
                 else t
@@ -356,10 +715,7 @@ def generate_evaluation_samples(
         gen_aligned = [
             (
                 F.interpolate(
-                    t.unsqueeze(0),
-                    size=(grid_h, grid_w),
-                    mode="bilinear",
-                    align_corners=False,
+                    t.unsqueeze(0), size=(grid_h, grid_w), mode="bilinear", align_corners=False
                 )[0]
                 if t.shape[1:] != (grid_h, grid_w)
                 else t
@@ -373,6 +729,7 @@ def generate_evaluation_samples(
         )
         save_image(comparison_grid, os.path.join(save_dir, "comparison_grid.png"))
 
+        # 2. denoising_progression.png の保存 (代表サンプル indices[0])
         if progression_tensors:
             progression_stack = torch.stack(progression_tensors, dim=0)
             progression_grid = make_grid(
@@ -385,14 +742,23 @@ def generate_evaluation_samples(
                 progression_grid, os.path.join(save_dir, "denoising_progression.png")
             )
 
+        # 3. attention_heatmap.png の保存 (代表サンプル indices[0])
+        save_attention_heatmap(
+            orig_vis=orig_vis_list[0],
+            gen_vis=gen_vis_list[0],
+            attn_weights_C=rep_attn_weights,
+            dataset=dataset,
+            ds_idx=indices[0],
+            save_dir=save_dir,
+        )
+
     model.train()
+    avg_psnr = sum(psnr_list) / len(psnr_list)
+    avg_ssim = sum(ssim_list) / len(ssim_list)
+    return avg_psnr, avg_ssim
 
 
 def resolve_resume_paths(resume_arg):
-    """
-    --resume に渡されたパス（ディレクトリ、model.pth、checkpoint.pt）を解析し、
-    (ckpt_file_path, ckpt_subdir, parent_run_dir) を返す
-    """
     resume_arg = os.path.normpath(resume_arg.strip())
     if not os.path.exists(resume_arg):
         raise FileNotFoundError(f"指定された再開パスが存在しません: {resume_arg}")
@@ -472,7 +838,6 @@ def run_training(
 
     iters_per_epoch = len(dataloader)
 
-    # 1. 目標イテレーション数の決定
     if target_iterations is None or target_iterations <= 0:
         target_iterations = estimate_target_iterations(
             dataset, batch_size=batch_size, timesteps=timesteps
@@ -483,14 +848,12 @@ def run_training(
 
     epochs = math.ceil(target_iterations / iters_per_epoch)
 
-    # 2. チェックポイント保存間隔の決定
     if save_every_epochs is None or save_every_epochs <= 0:
         save_every_epochs = estimate_save_every_epochs(epochs, iters_per_epoch)
         save_mode_str = "Auto"
     else:
         save_mode_str = "Manual"
 
-    # 3. ターミナル進捗ログ出力間隔の決定
     if log_every_epochs is None or log_every_epochs <= 0:
         log_every_epochs = estimate_log_every_epochs(
             epochs, iters_per_epoch, save_every_epochs
@@ -508,7 +871,6 @@ def run_training(
     metrics_history = []
     run_dir = None
 
-    # --- Resume 処理 ---
     if resume is not None and resume.strip() != "":
         ckpt_file, ckpt_subdir, parent_run_dir = resolve_resume_paths(resume)
         print(f"Resuming training from: {ckpt_file}")
@@ -597,6 +959,8 @@ def run_training(
 
     for epoch in range(start_epoch + 1, epochs + 1):
         epoch_loss = 0.0
+        epoch_mse = 0.0
+        epoch_l1 = 0.0
         grad_norm_A_sum = 0.0
         grad_norm_B_sum = 0.0
         grad_norm_C_sum = 0.0
@@ -660,26 +1024,22 @@ def run_training(
 
             optimizer.step()
             ema.update(model)
+
             epoch_loss += loss.item()
+            epoch_mse += mse_loss.mean().item()
+            epoch_l1 += l1_loss.mean().item()
             global_iter += 1
 
         scheduler.step()
+        current_lr = scheduler.get_last_lr()[0]
+
         num_batches = len(dataloader)
         avg_loss = epoch_loss / num_batches
+        avg_mse = epoch_mse / num_batches
+        avg_l1 = epoch_l1 / num_batches
         grad_norm_A = grad_norm_A_sum / num_batches
         grad_norm_B = grad_norm_B_sum / num_batches
         grad_norm_C = grad_norm_C_sum / num_batches
-
-        metrics_history.append(
-            {
-                "epoch": epoch,
-                "iteration": global_iter,
-                "loss": avg_loss,
-                "grad_A": grad_norm_A,
-                "grad_B": grad_norm_B,
-                "grad_C": grad_norm_C,
-            }
-        )
 
         is_save_step = (
             epoch % save_every_epochs == 0
@@ -688,8 +1048,22 @@ def run_training(
         )
         is_log_step = (epoch % log_every_epochs == 0) or is_save_step
 
+        record = {
+            "epoch": epoch,
+            "iteration": global_iter,
+            "loss": avg_loss,
+            "mse_loss": avg_mse,
+            "l1_loss": avg_l1,
+            "grad_A": grad_norm_A,
+            "grad_B": grad_norm_B,
+            "grad_C": grad_norm_C,
+            "lr": current_lr,
+            "eval_psnr": None,
+            "eval_ssim": None,
+        }
+        metrics_history.append(record)
+
         if is_log_step:
-            current_lr = scheduler.get_last_lr()[0]
             elapsed = time.time() - train_start_time
             done_epochs = epoch - start_epoch
             remain_epochs = epochs - epoch
@@ -700,7 +1074,7 @@ def run_training(
                 f"[Progress {progress_pct:5.1f}%] "
                 f"Epoch [{epoch:{epoch_digit_width}d}/{epochs}] "
                 f"(Iter: {global_iter:{iter_digit_width}d}/{total_planned_iters}) | "
-                f"Loss: {avg_loss:.6f} | "
+                f"Loss: {avg_loss:.6f} (MSE:{avg_mse:.4f}/L1:{avg_l1:.4f}) | "
                 f"Grad(A/B/C): {grad_norm_A:.4f}/{grad_norm_B:.4f}/{grad_norm_C:.4f} | "
                 f"LR: {current_lr:.2e} | "
                 f"Elapsed: {format_duration(elapsed)} | ETA: {format_duration(eta_sec)}",
@@ -711,11 +1085,23 @@ def run_training(
             ckpt_subdir = os.path.join(run_dir, f"epoch{epoch}_iter{global_iter}")
             os.makedirs(ckpt_subdir, exist_ok=True)
 
-            # 1. 推論互換用のEMA重みファイル (model.pth)
+            # 1. サンプル推論・デノイジング過程・トークン別ヒートマップ生成 & PSNR/SSIM 計測
+            eval_psnr, eval_ssim = generate_evaluation_samples(
+                ema.ema_model,
+                dataset,
+                device,
+                ckpt_subdir,
+                max_steps=timesteps,
+                eval_res=eval_res,
+            )
+            record["eval_psnr"] = eval_psnr
+            record["eval_ssim"] = eval_ssim
+
+            # 2. 推論互換用のEMA重みファイル (model.pth)
             ckpt_path = os.path.join(ckpt_subdir, "model.pth")
             torch.save(ema.ema_model.state_dict(), ckpt_path)
 
-            # 2. Resume用の完全状態ファイル (checkpoint.pt)
+            # 3. Resume用の完全状態ファイル (checkpoint.pt)
             full_ckpt_path = os.path.join(ckpt_subdir, "checkpoint.pt")
             torch.save(
                 {
@@ -730,18 +1116,12 @@ def run_training(
                 full_ckpt_path,
             )
 
+            # 4. CSVおよび3段グラフの保存 (PSNR/SSIM反映後)
             save_metrics_csv_and_plot(metrics_history, ckpt_subdir)
 
-            generate_evaluation_samples(
-                ema.ema_model,
-                dataset,
-                device,
-                ckpt_subdir,
-                max_steps=timesteps,
-                eval_res=eval_res,
-            )
             print(
-                f"  --> [Checkpoint Saved] {ckpt_subdir}",
+                f"  --> [Checkpoint Saved] {ckpt_subdir} | "
+                f"Eval PSNR: {eval_psnr:.2f} dB | Eval SSIM: {eval_ssim:.4f}",
                 flush=True,
             )
 
