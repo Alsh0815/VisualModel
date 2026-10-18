@@ -66,15 +66,14 @@ class TripleStreamModel(nn.Module):
     def __init__(
         self,
         in_channels=3,
-        hidden_dim_A=128,
-        hidden_dim_B=64,
-        hidden_dim_C=64,
+        hidden_dim_A=192,  # 【改良】128 -> 192 (高解像度の構図保持力を強化)
+        hidden_dim_B=96,  # 【改良】64 -> 96 (中域のパーツ境界・輪郭容量を拡大)
+        hidden_dim_C=96,  # 【改良】64 -> 96 (高周波テクスチャ・色면分離を強化)
         text_dim=768,
         max_tokens_A_edge=32,
     ):
         super().__init__()
 
-        # Stream A の長辺上限トークン数（高解像度時のAttention希釈を防止）
         self.max_tokens_A_edge = max_tokens_A_edge
 
         self.time_dim = 128
@@ -88,13 +87,24 @@ class TripleStreamModel(nn.Module):
         self.t_proj_B = nn.Linear(self.time_dim, hidden_dim_B)
         self.t_proj_C = nn.Linear(self.time_dim, hidden_dim_C)
 
-        # --- Stream A (Global / 低周波) ---
+        # --- Stream A (Global / 低周波: 2層 Self-Attention 化) ---
         self.proj_A = nn.Conv2d(in_channels, hidden_dim_A, kernel_size=3, padding=1)
         self.norm_A = nn.LayerNorm(hidden_dim_A)
         self.attn_A = nn.MultiheadAttention(
             embed_dim=hidden_dim_A, num_heads=8, batch_first=True
         )
         self.ffn_A = nn.Sequential(
+            nn.LayerNorm(hidden_dim_A),
+            nn.Linear(hidden_dim_A, hidden_dim_A * 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim_A * 2, hidden_dim_A),
+        )
+        # 【追加】2段目の Global Attention ブロック（プロンプト後半の衣装・ポーズまで統合）
+        self.norm_A2 = nn.LayerNorm(hidden_dim_A)
+        self.attn_A2 = nn.MultiheadAttention(
+            embed_dim=hidden_dim_A, num_heads=8, batch_first=True
+        )
+        self.ffn_A2 = nn.Sequential(
             nn.LayerNorm(hidden_dim_A),
             nn.Linear(hidden_dim_A, hidden_dim_A * 2),
             nn.GELU(),
@@ -107,9 +117,13 @@ class TripleStreamModel(nn.Module):
             else nn.Identity()
         )
 
-        # --- Stream B (Relational / 中周波) ---
+        # --- Stream B (Relational / 中周波: テキスト条件注入 + Dilation 1,2,4,8) ---
         self.proj_B = nn.Conv2d(in_channels, hidden_dim_B, kernel_size=3, padding=1)
-        # 勾配監視用に mix_B[0].weight を先頭に維持しつつ、Dilation(1, 2, 4)で広域受容野を確保
+        # 【追加】Stream B が「どの画像を描いているか」を識別するための条件変調 (FiLM)
+        self.cond_proj_B = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(self.time_dim + text_dim, hidden_dim_B * 2),
+        )
         self.mix_B = nn.Sequential(
             nn.Conv2d(
                 hidden_dim_B,
@@ -123,13 +137,17 @@ class TripleStreamModel(nn.Module):
             ConvNeXtBlock(hidden_dim_B, kernel_size=5, dilation=1, num_groups=8),
             ConvNeXtBlock(hidden_dim_B, kernel_size=5, dilation=2, num_groups=8),
             ConvNeXtBlock(hidden_dim_B, kernel_size=5, dilation=4, num_groups=8),
+            ConvNeXtBlock(
+                hidden_dim_B, kernel_size=5, dilation=8, num_groups=8
+            ),  # 【追加】256px以上の広域受容野
+        )
+        self.post_B = ConvNeXtBlock(
+            hidden_dim_B, kernel_size=3, dilation=1, num_groups=8
         )
 
         # --- Stream C (Texture / 高周波) ---
         self.proj_C = nn.Conv2d(in_channels, hidden_dim_C, kernel_size=3, padding=1)
-        self.pre_attn_ab_to_c = nn.Conv2d(
-            hidden_dim_B, hidden_dim_C, kernel_size=1
-        )  # 【追加】構図ガイド注入用
+        self.pre_attn_ab_to_c = nn.Conv2d(hidden_dim_B, hidden_dim_C, kernel_size=1)
         self.norm_C_attn = nn.LayerNorm(hidden_dim_C)
         self.cross_attn_C = nn.MultiheadAttention(
             embed_dim=hidden_dim_C, num_heads=4, batch_first=True
@@ -142,10 +160,11 @@ class TripleStreamModel(nn.Module):
         )
         self.text_proj_C = nn.Linear(text_dim, hidden_dim_C)
 
-        # 高解像度のエッジ・塗りを削り出す3層テクスチャ抽出ブロック
+        # 【改良】dilation=4 を追加した4層構成で256px以上の色ムラ・境界ボケを解消
         self.conv_C = nn.Sequential(
             ConvNeXtBlock(hidden_dim_C, kernel_size=3, dilation=1, num_groups=8),
             ConvNeXtBlock(hidden_dim_C, kernel_size=3, dilation=2, num_groups=8),
+            ConvNeXtBlock(hidden_dim_C, kernel_size=3, dilation=4, num_groups=8),
             ConvNeXtBlock(hidden_dim_C, kernel_size=3, dilation=1, num_groups=8),
         )
 
@@ -224,7 +243,7 @@ class TripleStreamModel(nn.Module):
         if pad_mask.all(dim=1).any():
             pad_mask = None
 
-        # === 2. Stream A (Global) ===
+        # === 2. Stream A (Global: 2段 Self-Attention) ===
         h_A = self.proj_A(x_A) + t_A.permute(0, 2, 1).unsqueeze(-1)
         _, C_A, H_A, W_A = h_A.shape
         h_A_flat = h_A.view(B, C_A, -1).permute(0, 2, 1)  # [B, H_A*W_A, C_A]
@@ -235,9 +254,7 @@ class TripleStreamModel(nn.Module):
         ctx_A = self.text_proj_A(context)
         seq_len_A = h_A_flat.shape[1]
         concat_input = torch.cat([h_A_flat, ctx_A, t_A], dim=1)
-        concat_norm = self.norm_A(concat_input)
 
-        # 【追加】Stream A の Self-Attention にも PAD マスクを適用
         if pad_mask is not None:
             img_mask = torch.zeros((B, seq_len_A), dtype=torch.bool, device=x.device)
             t_mask = torch.zeros((B, 1), dtype=torch.bool, device=x.device)
@@ -245,17 +262,45 @@ class TripleStreamModel(nn.Module):
         else:
             full_mask_A = None
 
-        attn_out_flat, _ = self.attn_A(
+        # 1層目 Attention + FFN
+        concat_norm = self.norm_A(concat_input)
+        attn_out_1, _ = self.attn_A(
             concat_norm, concat_norm, concat_norm, key_padding_mask=full_mask_A
         )
-        out_A_flat = h_A_flat + attn_out_flat[:, :seq_len_A, :]
-        out_A_flat = out_A_flat + self.ffn_A(out_A_flat)
+        concat_input = concat_input + attn_out_1
+        concat_input = concat_input + self.ffn_A(concat_input)
+
+        # 2層目 Attention + FFN
+        concat_norm2 = self.norm_A2(concat_input)
+        attn_out_2, _ = self.attn_A2(
+            concat_norm2, concat_norm2, concat_norm2, key_padding_mask=full_mask_A
+        )
+        concat_input = concat_input + attn_out_2
+        out_A_flat = concat_input[:, :seq_len_A, :] + self.ffn_A2(
+            concat_input[:, :seq_len_A, :]
+        )
+
         out_A = out_A_flat.permute(0, 2, 1).view(B, C_A, H_A, W_A)
         out_A = self.spatial_A(out_A)
 
-        # === 3. Stream B (Relational) ===
+        # === 3. Stream B (Relational: テキスト+時刻のFiLM変調付き) ===
+        if pad_mask is not None:
+            valid_mask = (~pad_mask).float().unsqueeze(-1)  # [B, Seq_Len, 1]
+            ctx_pooled = (context * valid_mask).sum(dim=1) / valid_mask.sum(
+                dim=1
+            ).clamp(min=1.0)
+        else:
+            ctx_pooled = context.mean(dim=1)
+
+        cond_B = self.cond_proj_B(torch.cat([t_emb, ctx_pooled], dim=-1))
+        gamma_B, beta_B = cond_B.chunk(2, dim=-1)
+        gamma_B = gamma_B.unsqueeze(-1).unsqueeze(-1)
+        beta_B = beta_B.unsqueeze(-1).unsqueeze(-1)
+
         h_B = self.proj_B(x_B) + t_B
         out_B = h_B + self.mix_B(h_B)
+        out_B = (1.0 + gamma_B) * out_B + beta_B
+        out_B = self.post_B(out_B)
 
         # === 4. Pre-Fusion (Stream A+B の構図情報を先に統合) ===
         up_A = F.interpolate(

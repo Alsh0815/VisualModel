@@ -1016,7 +1016,7 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = TripleStreamModel(in_channels=3, hidden_dim_C=64).to(device)
+    model = TripleStreamModel(in_channels=3).to(device)
     ema = EMAModel(model, decay=0.9995)
 
     optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
@@ -1200,7 +1200,8 @@ def run_training(
                 dim=[1, 2, 3]
             )
 
-            combined_loss = 0.5 * mse_loss + 0.5 * l1_loss
+            # combined_loss = 0.5 * mse_loss + 0.5 * l1_loss
+            combined_loss = 0.3 * mse_loss + 0.7 * l1_loss
             loss = (combined_loss * snr_weight).mean()
 
             loss.backward()
