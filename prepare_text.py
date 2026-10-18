@@ -45,13 +45,11 @@ def create_caption_tensors(subset, datasets_root="datasets"):
         )
         return
 
-    # 日本語対応の軽量な事前学習済みモデル (BERT-base)
     model_name = "cl-tohoku/bert-base-japanese-v3"
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     text_encoder = AutoModel.from_pretrained(model_name)
     text_encoder.eval()
 
-    # BERTの出力(768次元)を、PoCモデルの仕様(128次元)に圧縮する固定プロジェクション層
     torch.manual_seed(42)
     dim_proj = nn.Linear(768, 128)
     dim_proj.eval()
@@ -67,18 +65,21 @@ def create_caption_tensors(subset, datasets_root="datasets"):
             )
 
             outputs = text_encoder(**inputs)
-            hidden_states = outputs.last_hidden_state
+            hidden_states = outputs.last_hidden_state  # [1, 256, 768]
 
-            # PoCモデルの要件 (M=4) に合わせるため、最初の4トークンを抽出
-            tokens_m4 = hidden_states[:, :4, :]
+            # 4トークンの切り捨てを行わず、全256トークンを [256, 128] として保存
+            context_tensor = dim_proj(hidden_states).squeeze(0)
 
-            # 次元数を 768 -> 128 に圧縮し、バッチ次元を外して [4, 128] として保存
-            context_tensor = dim_proj(tokens_m4).squeeze(0)
-
-            # 画像と同じベース名で同階層に保存 (例: image_01.pt)
             save_name = f"{base_name}.pt"
             save_path = os.path.join(target_dir, save_name)
             torch.save(context_tensor, save_path)
+
+            # ヒートマップ表示用にトークン文字列リストも保存
+            ids = inputs["input_ids"][0].tolist()
+            tokens = tokenizer.convert_ids_to_tokens(ids)
+            tok_json_path = os.path.join(target_dir, f"{base_name}.tokens.json")
+            with open(tok_json_path, "w", encoding="utf-8") as f:
+                json.dump(tokens, f, ensure_ascii=False)
 
             preview = text.replace("\n", " ")[:40]
             print(

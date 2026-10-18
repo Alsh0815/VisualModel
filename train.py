@@ -427,177 +427,163 @@ def get_tokenizer():
                 "cl-tohoku/bert-base-japanese-v3"
             )
         except Exception as e:
-            print(f"Warning: トークナイザーの読み込みをスキップしました ({e})")
+            print(f"Warning: AutoTokenizerのロードに失敗しました ({e})")
             _CACHED_TOKENIZER = False
     return _CACHED_TOKENIZER if _CACHED_TOKENIZER is not False else None
 
 
-def find_caption_for_sample(dataset, ds_idx):
-    """dataset内のあらゆる属性・ディレクトリから ds_idx 番目のキャプション文字列を探索する"""
-    img_path = None
-
-    # 1. datasetオブジェクトの全属性からパス文字列を探索
-    for attr_name, attr_val in vars(dataset).items():
-        if isinstance(attr_val, list) and len(attr_val) > ds_idx:
-            elem = attr_val[ds_idx]
-            if isinstance(elem, str):
-                img_path = elem
-                break
-            elif isinstance(elem, (tuple, list)) and len(elem) > 0:
-                for item in elem:
-                    if isinstance(item, str):
-                        img_path = item
-                        break
-                if img_path:
-                    break
-            elif isinstance(elem, dict):
-                for v in elem.values():
-                    if isinstance(v, str) and (
-                        "/" in v
-                        or "\\" in v
-                        or v.endswith((".png", ".jpg", ".webp", ".pt"))
-                    ):
-                        img_path = v
-                        break
-                if img_path:
-                    break
-
-    if img_path is None:
-        return None
-
+def load_sample_caption_and_tokens(dataset, ds_idx, seq_len):
+    """
+    dataset.samples[ds_idx] から直接画像パスを取得し、
+    同階層の <base_name>.txt および <base_name>.tokens.json を読み込む
+    """
+    sample_tuple = dataset.samples[ds_idx]
+    img_path = sample_tuple[0]  # (img_path, text_path, best_bucket) の先頭要素
     base_no_ext = os.path.splitext(img_path)[0]
-    folder = os.path.dirname(img_path)
-    fname = os.path.basename(img_path)
-    bname = os.path.basename(base_no_ext)
+    target_dir = os.path.dirname(img_path)
+    base_name = os.path.basename(base_no_ext)
 
-    # 2. 同名の .txt / .caption ファイルを探索
-    for ext in (".txt", ".caption", ".prompt"):
-        cand = base_no_ext + ext
-        if os.path.exists(cand):
-            with open(cand, "r", encoding="utf-8") as f:
-                return f.read().strip()
-
-    # 3. フォルダ内の JSON / CSV / TXT 一覧ファイルを探索
-    for json_name in ("captions.json", "prompts.json", "metadata.json"):
-        json_path = os.path.join(folder, json_name)
+    # 1. 個別の .txt ファイルを読み込む
+    caption = None
+    txt_path = f"{base_no_ext}.txt"
+    if os.path.exists(txt_path):
+        with open(txt_path, "r", encoding="utf-8") as f:
+            caption = f.read().strip()
+    else:
+        # captions.json フォールバック
+        json_path = os.path.join(target_dir, "captions.json")
         if os.path.exists(json_path):
-            try:
-                with open(json_path, "r", encoding="utf-8") as f:
-                    cap_dict = json.load(f)
-                if isinstance(cap_dict, dict):
-                    for key in (fname, bname, bname.replace("image", "caption")):
-                        if key in cap_dict:
-                            val = cap_dict[key]
-                            return val if isinstance(val, str) else str(val)
-            except Exception:
-                pass
+            with open(json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            caption = data.get(os.path.basename(img_path)) or data.get(base_name)
 
-    return None
+    # 2. prepare_text.py が保存した .tokens.json があれば優先使用
+    tok_json_path = f"{base_no_ext}.tokens.json"
+    if os.path.exists(tok_json_path):
+        with open(tok_json_path, "r", encoding="utf-8") as f:
+            raw_tokens = json.load(f)
+        return caption, raw_tokens
+
+    # 3. .tokens.json が無い場合はその場でトークナイズ
+    if caption:
+        tokenizer = get_tokenizer()
+        if tokenizer is not None:
+            inputs = tokenizer(
+                caption,
+                return_tensors="pt",
+                padding="max_length",
+                max_length=seq_len,
+                truncation=True,
+            )
+            ids = inputs["input_ids"][0].tolist()
+            return caption, tokenizer.convert_ids_to_tokens(ids)
+
+        # 万が一 fugashi/unidic-lite 未導入で tokenizer が動かない場合でも
+        # .txt の文字列を句読点・助詞で分割して日本語ラベルを作る
+        fallback_words = [
+            w
+            for w in re.split(
+                r"[、。，．・\s 「」（）()のにをはがとでやもへ]+", caption
+            )
+            if w
+        ]
+        # [CLS] が index 0 なので index 1 から順に割り当て
+        raw_tokens = ["[CLS]"] + fallback_words[: seq_len - 1]
+        return caption, raw_tokens
+
+    return None, None
 
 
-def build_individual_token_list(caption, seq_len):
+def build_token_display_items(dataset, ds_idx, seq_len):
     """
-    複数トークンの結合を行わず、各トークンを 1対1 で個別リスト化する。
-    戻り値: [(表示ラベル, トークンインデックス), ...]
+    ヒートマップに表示する [(単語ラベル, トークンインデックスリスト), ...] を構築する
     """
-    tokenizer = get_tokenizer()
+    caption, raw_tokens = load_sample_caption_and_tokens(dataset, ds_idx, seq_len)
 
-    # キャプション文字列が取得できた場合はトークナイズして個別トークン名を付与
-    if tokenizer is not None and caption:
-        inputs = tokenizer(
-            caption,
-            return_tensors="pt",
-            padding="max_length",
-            max_length=seq_len,
-            truncation=True,
+    if not raw_tokens:
+        return [(f"Token #{i}", [i]) for i in range(min(seq_len, 14))]
+
+    # サブワード (##) だけを元の単語に結合し、単語自体は結合しない（1単語＝1パネル）
+    merged_words = []
+    i = 0
+    limit = min(len(raw_tokens), seq_len)
+    while i < limit:
+        tok = raw_tokens[i]
+        if tok in ("[CLS]", "[SEP]", "[PAD]", "[UNK]"):
+            i += 1
+            continue
+        word = tok[2:] if tok.startswith("##") else tok
+        idxs = [i]
+        j = i + 1
+        while j < limit and raw_tokens[j].startswith("##"):
+            word += raw_tokens[j][2:]
+            idxs.append(j)
+            j += 1
+        i = j
+        merged_words.append((word, idxs))
+
+    skip_set = {
+        "、",
+        "。",
+        "，",
+        "．",
+        "・",
+        "：",
+        "；",
+        "！",
+        "？",
+        "（",
+        "）",
+        "(",
+        ")",
+        "「",
+        "」",
+        "『",
+        "』",
+        "【",
+        "】",
+        "の",
+        "に",
+        "を",
+        "は",
+        "が",
+        "と",
+        "で",
+        "や",
+        "も",
+        "へ",
+        "な",
+        "た",
+        "て",
+        "し",
+    }
+    filtered = [
+        (w, idxs)
+        for w, idxs in merged_words
+        if w not in skip_set and len(w.strip()) > 0
+    ]
+
+    # seq_len=4 等の旧テンソルでフィルタ後に項目が減りすぎた場合はフィルタ前の全トークンを返す
+    if len(filtered) < min(3, len(merged_words)):
+        return (
+            merged_words
+            if merged_words
+            else [(f"Token #{k}", [k]) for k in range(limit)]
         )
-        ids = inputs["input_ids"][0].tolist()
-        raw_tokens = tokenizer.convert_ids_to_tokens(ids)
 
-        skip_set = {
-            "[CLS]",
-            "[SEP]",
-            "[PAD]",
-            "[UNK]",
-            "、",
-            "。",
-            "，",
-            "．",
-            "・",
-            "：",
-            "；",
-            "！",
-            "？",
-            "（",
-            "）",
-            "(",
-            ")",
-            "「",
-            "」",
-            "『",
-            "』",
-            "【",
-            "】",
-            "の",
-            "に",
-            "を",
-            "は",
-            "が",
-            "と",
-            "で",
-            "や",
-            "も",
-            "へ",
-            "な",
-            "た",
-            "て",
-            "し",
-        }
-
-        token_list = []
-        for i, tok in enumerate(raw_tokens):
-            if i >= seq_len:
-                break
-            if tok in ("[CLS]", "[SEP]", "[PAD]"):
-                continue
-            clean_tok = tok[2:] if tok.startswith("##") else tok
-            if clean_tok in skip_set or len(clean_tok.strip()) == 0:
-                continue
-            token_list.append((clean_tok, i))
-
-        if len(token_list) >= 2:
-            return token_list
-
-    # キャプションファイルが無い場合、またはトークンが1つ以下になった場合は
-    # seq_len の各インデックスを1つずつ個別トークンとして返す
-    num_fallback = min(seq_len, 14)
-    return [(f"Token #{i}", i) for i in range(num_fallback)]
+    return filtered
 
 
 @torch.no_grad()
 def save_attention_heatmap(
     orig_vis, gen_vis, attn_weights_C, dataset, ds_idx, save_dir, max_display_tokens=14
 ):
-    """
-    代表1枚（denoising_progression.png と同じサンプル）について、
-    個々のトークンごとの Cross-Attention ヒートマップを並べて保存する。
-    """
     if attn_weights_C is None:
-        print("Warning: [Heatmap] attn_weights_C が取得できませんでした。")
         return
 
     font_prop = get_japanese_font_prop()
-
-    # attn_weights_C: [1, H*W, Seq_Len]
     _, HW, seq_len = attn_weights_C.shape
     _, H, W = gen_vis.shape
-
-    # 万が一 context のトークン長自体が 1 の場合は警告を出す
-    if seq_len <= 1:
-        print(
-            f"Warning: [Heatmap] 入力テキストテンソル(.pt)のトークン長(seq_len)が {seq_len} しかありません！"
-            f" 全トークンで空間全体の平均しか計算できないため、prepare_text.py の出力形状を確認してください。"
-        )
 
     attn_map_2d = attn_weights_C[0].transpose(0, 1).contiguous()  # [Seq_Len, H*W]
     if HW == H * W:
@@ -610,38 +596,30 @@ def save_attention_heatmap(
             attn_map_2d, size=(H, W), mode="bilinear", align_corners=False
         )[0]
 
-    caption = find_caption_for_sample(dataset, ds_idx)
-    token_items = build_individual_token_list(caption, seq_len)
+    token_items = build_token_display_items(dataset, ds_idx, seq_len)
 
     scored_maps = []
-    for word, tok_idx in token_items:
-        if tok_idx >= seq_len:
+    for word, idxs in token_items:
+        valid_idxs = [idx for idx in idxs if idx < seq_len]
+        if not valid_idxs:
             continue
-        single_map = attn_map_2d[
-            tok_idx
-        ]  # [H, W] (結合せず単一トークンのマップをそのまま使用)
+        tok_map = attn_map_2d[valid_idxs].mean(dim=0)  # [H, W]
         smoothed = F.avg_pool2d(
-            single_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
+            tok_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
         )[0, 0]
-
-        # ほとんどゼロのパディング領域を除外するためピークとコントラストでスコア化
         q95 = float(torch.quantile(smoothed.flatten(), 0.95).item())
         q50 = float(torch.quantile(smoothed.flatten(), 0.50).item())
         contrast_score = (q95 - q50) + 0.1 * q95
-        scored_maps.append((contrast_score, word, tok_idx, smoothed.cpu().numpy()))
+        scored_maps.append(
+            (contrast_score, word, valid_idxs[0], smoothed.cpu().numpy())
+        )
 
     if not scored_maps:
         return
 
-    # 反応が明確な上位 max_display_tokens 個を選出し、トークン番号順にソート
     scored_maps.sort(key=lambda x: x[0], reverse=True)
     selected = scored_maps[:max_display_tokens]
     selected.sort(key=lambda x: x[2])
-
-    print(
-        f"  -> [Heatmap] seq_len={seq_len} | caption_found={caption is not None} | "
-        f"displaying {len(selected)} token panels"
-    )
 
     orig_np = orig_vis.permute(1, 2, 0).cpu().numpy()
     gen_np = gen_vis.permute(1, 2, 0).cpu().numpy()
