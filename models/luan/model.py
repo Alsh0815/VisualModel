@@ -69,7 +69,7 @@ class TripleStreamModel(nn.Module):
         hidden_dim_A=128,
         hidden_dim_B=64,
         hidden_dim_C=64,
-        text_dim=128,
+        text_dim=768,
         max_tokens_A_edge=32,
     ):
         super().__init__()
@@ -127,6 +127,9 @@ class TripleStreamModel(nn.Module):
 
         # --- Stream C (Texture / 高周波) ---
         self.proj_C = nn.Conv2d(in_channels, hidden_dim_C, kernel_size=3, padding=1)
+        self.pre_attn_ab_to_c = nn.Conv2d(
+            hidden_dim_B, hidden_dim_C, kernel_size=1
+        )  # 【追加】構図ガイド注入用
         self.norm_C_attn = nn.LayerNorm(hidden_dim_C)
         self.cross_attn_C = nn.MultiheadAttention(
             embed_dim=hidden_dim_C, num_heads=4, batch_first=True
@@ -216,6 +219,11 @@ class TripleStreamModel(nn.Module):
         x_B = self._pool_stream_b(x)
         x_C = x
 
+        # 【追加】ゼロ埋めされた [PAD] トークンを自動検出しマスクを作成 (True = 無視する位置)
+        pad_mask = context.abs().sum(dim=-1) < 1e-6  # [B, Seq_Len]
+        if pad_mask.all(dim=1).any():
+            pad_mask = None
+
         # === 2. Stream A (Global) ===
         h_A = self.proj_A(x_A) + t_A.permute(0, 2, 1).unsqueeze(-1)
         _, C_A, H_A, W_A = h_A.shape
@@ -229,7 +237,17 @@ class TripleStreamModel(nn.Module):
         concat_input = torch.cat([h_A_flat, ctx_A, t_A], dim=1)
         concat_norm = self.norm_A(concat_input)
 
-        attn_out_flat, _ = self.attn_A(concat_norm, concat_norm, concat_norm)
+        # 【追加】Stream A の Self-Attention にも PAD マスクを適用
+        if pad_mask is not None:
+            img_mask = torch.zeros((B, seq_len_A), dtype=torch.bool, device=x.device)
+            t_mask = torch.zeros((B, 1), dtype=torch.bool, device=x.device)
+            full_mask_A = torch.cat([img_mask, pad_mask, t_mask], dim=1)
+        else:
+            full_mask_A = None
+
+        attn_out_flat, _ = self.attn_A(
+            concat_norm, concat_norm, concat_norm, key_padding_mask=full_mask_A
+        )
         out_A_flat = h_A_flat + attn_out_flat[:, :seq_len_A, :]
         out_A_flat = out_A_flat + self.ffn_A(out_A_flat)
         out_A = out_A_flat.permute(0, 2, 1).view(B, C_A, H_A, W_A)
@@ -239,23 +257,7 @@ class TripleStreamModel(nn.Module):
         h_B = self.proj_B(x_B) + t_B
         out_B = h_B + self.mix_B(h_B)
 
-        # === 4. Stream C (Texture) ===
-        h_C = self.proj_C(x_C) + t_C
-        _, C_C, H_C, W_C = h_C.shape
-        h_C_flat = h_C.view(B, C_C, -1).permute(0, 2, 1)  # [B, H_C*W_C, C_C]
-
-        pos_embed_C = get_2d_normalized_sincos_pos_embed(C_C, H_C, W_C, x.device)
-        h_C_q = self.norm_C_attn(h_C_flat + pos_embed_C)
-
-        ctx_proj = self.text_proj_C(context)
-        attn_out_C, _ = self.cross_attn_C(h_C_q, ctx_proj, ctx_proj)
-        h_C_flat = h_C_flat + attn_out_C
-        h_C_flat = h_C_flat + self.ffn_C(h_C_flat)
-        h_C_attn = h_C_flat.permute(0, 2, 1).view(B, C_C, H_C, W_C)
-
-        out_C = self.conv_C(h_C_attn)
-
-        # === 5. Fusion層 (カスケード型アフィン変換) ===
+        # === 4. Pre-Fusion (Stream A+B の構図情報を先に統合) ===
         up_A = F.interpolate(
             out_A,
             size=(out_B.shape[2], out_B.shape[3]),
@@ -269,12 +271,31 @@ class TripleStreamModel(nn.Module):
             fusion_AB, size=(H, W), mode="bilinear", align_corners=False
         )
         up_AB = up_AB + self.fusion_refine_AB(up_AB)
+
+        # === 5. Stream C (Texture: 構図コンテキストを持った状態で Cross-Attention) ===
+        # 【修正】生のRGBだけでなく Stream A+B の構図特徴(up_AB)を足して Query を作る
+        h_C = self.proj_C(x_C) + t_C + self.pre_attn_ab_to_c(up_AB)
+        _, C_C, H_C, W_C = h_C.shape
+        h_C_flat = h_C.view(B, C_C, -1).permute(0, 2, 1)  # [B, H_C*W_C, C_C]
+
+        pos_embed_C = get_2d_normalized_sincos_pos_embed(C_C, H_C, W_C, x.device)
+        h_C_q = self.norm_C_attn(h_C_flat + pos_embed_C)
+
+        ctx_proj = self.text_proj_C(context)
+        attn_out_C, _ = self.cross_attn_C(
+            h_C_q, ctx_proj, ctx_proj, key_padding_mask=pad_mask
+        )
+        h_C_flat = h_C_flat + attn_out_C
+        h_C_flat = h_C_flat + self.ffn_C(h_C_flat)
+        h_C_attn = h_C_flat.permute(0, 2, 1).view(B, C_C, H_C, W_C)
+
+        out_C = self.conv_C(h_C_attn)
+
+        # === 6. Final Modulation & Output ===
         gamma = self.fusion_AB_to_C_gamma(up_AB)
         beta = self.fusion_AB_to_C_beta(up_AB)
-
         fusion_final = (1.0 + gamma) * out_C + beta
 
-        # === 6. Output ===
         output = self.out_proj(self.out_act(self.out_norm(fusion_final)))
         return output
 

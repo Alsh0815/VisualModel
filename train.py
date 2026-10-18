@@ -503,7 +503,6 @@ def build_token_display_items(dataset, ds_idx, seq_len):
     if not raw_tokens:
         return [(f"Token #{i}", [i]) for i in range(min(seq_len, 14))]
 
-    # サブワード (##) だけを元の単語に結合し、単語自体は結合しない（1単語＝1パネル）
     merged_words = []
     i = 0
     limit = min(len(raw_tokens), seq_len)
@@ -522,6 +521,7 @@ def build_token_display_items(dataset, ds_idx, seq_len):
         i = j
         merged_words.append((word, idxs))
 
+    # 【修正】助詞・記号に加え、ヒートマップのノイズになる文末表現・補助動詞・抽象語を除外
     skip_set = {
         "、",
         "。",
@@ -556,14 +556,66 @@ def build_token_display_items(dataset, ds_idx, seq_len):
         "た",
         "て",
         "し",
+        "から",
+        "まで",
+        "より",
+        "ほど",
+        "くらい",
+        "など",
+        "といった",
+        "ような",
+        "ように",
+        "よう",
+        "ます",
+        "です",
+        "でした",
+        "ました",
+        "いる",
+        "いた",
+        "いて",
+        "おり",
+        "ある",
+        "あっ",
+        "れる",
+        "られる",
+        "せる",
+        "させる",
+        "され",
+        "でき",
+        "ない",
+        "ず",
+        "ん",
+        "こと",
+        "もの",
+        "ため",
+        "ところ",
+        "あたり",
+        "感じ",
+        "印象",
+        "雰囲気",
+        "全体",
+        "特徴",
+        "特徴的",
+        "見せ",
+        "見え",
+        "浮かべ",
+        "浮かぶ",
+        "写り",
+        "込ん",
+        "組み合わさり",
+        "あしらわ",
+        "身につけ",
+        "添え",
+        "持っ",
     }
     filtered = [
         (w, idxs)
         for w, idxs in merged_words
-        if w not in skip_set and len(w.strip()) > 0
+        if w not in skip_set
+        and len(w.strip()) > 0
+        and not re.fullmatch(r"[ぁ-ん]{1}", w)
     ]
 
-    # seq_len=4 等の旧テンソルでフィルタ後に項目が減りすぎた場合はフィルタ前の全トークンを返す
     if len(filtered) < min(3, len(merged_words)):
         return (
             merged_words
@@ -598,20 +650,33 @@ def save_attention_heatmap(
 
     token_items = build_token_display_items(dataset, ds_idx, seq_len)
 
+    # 空間方向だけでなくトークン方向にも平均値を引いて「全トークン共通で反応しやすい背景バイアス」を除去
+    valid_token_indices = [
+        idx for _, idxs in token_items for idx in idxs if idx < seq_len
+    ]
+    if valid_token_indices:
+        spatial_baseline = attn_map_2d[valid_token_indices].mean(dim=0, keepdim=True)
+        rel_attn_map = torch.clamp(attn_map_2d - spatial_baseline, min=0.0)
+    else:
+        rel_attn_map = attn_map_2d
+
     scored_maps = []
     for word, idxs in token_items:
         valid_idxs = [idx for idx in idxs if idx < seq_len]
         if not valid_idxs:
             continue
-        tok_map = attn_map_2d[valid_idxs].mean(dim=0)  # [H, W]
+        raw_tok_map = attn_map_2d[valid_idxs].mean(dim=0)
+        rel_tok_map = rel_attn_map[valid_idxs].mean(dim=0)
         smoothed = F.avg_pool2d(
-            tok_map.unsqueeze(0).unsqueeze(0), kernel_size=3, stride=1, padding=1
+            rel_tok_map.unsqueeze(0).unsqueeze(0), kernel_size=5, stride=1, padding=2
         )[0, 0]
+
+        peak_raw = float(raw_tok_map.max().item())
         q95 = float(torch.quantile(smoothed.flatten(), 0.95).item())
         q50 = float(torch.quantile(smoothed.flatten(), 0.50).item())
-        contrast_score = (q95 - q50) + 0.1 * q95
+        contrast_score = q95 - q50
         scored_maps.append(
-            (contrast_score, word, valid_idxs[0], smoothed.cpu().numpy())
+            (contrast_score, word, valid_idxs[0], smoothed.cpu().numpy(), peak_raw)
         )
 
     if not scored_maps:
@@ -620,6 +685,9 @@ def save_attention_heatmap(
     scored_maps.sort(key=lambda x: x[0], reverse=True)
     selected = scored_maps[:max_display_tokens]
     selected.sort(key=lambda x: x[2])
+
+    # 【修正】ピークが極小のトークンが真っ赤に誇張されるのを防ぐため、全体の上位値を基準の下限にする
+    global_ref_max = max([float(np.percentile(m[3], 99.0)) for m in selected] + [1e-6])
 
     orig_np = orig_vis.permute(1, 2, 0).cpu().numpy()
     gen_np = gen_vis.permute(1, 2, 0).cpu().numpy()
@@ -643,24 +711,25 @@ def save_attention_heatmap(
 
     cmap = plt.get_cmap("jet")
 
-    for idx, (score, word, tok_pos, hmap) in enumerate(selected):
+    for idx, (score, word, tok_pos, hmap, peak_raw) in enumerate(selected):
         ax = axes[2 + idx]
-        h_min, h_max = float(hmap.min()), float(hmap.max())
-        if h_max - h_min > 1e-8:
-            h_norm = (hmap - h_min) / (h_max - h_min)
-        else:
-            h_norm = np.zeros_like(hmap)
+        h_min = float(hmap.min())
+        # 個別ピークと全体基準のハイブリッド分母で正規化（弱いトークンは控えめな色になる）
+        denom = max(
+            float(np.percentile(hmap, 99.5)) - h_min, global_ref_max * 0.5, 1e-6
+        )
+        h_norm = np.clip((hmap - h_min) / denom, 0.0, 1.0)
 
-        h_emph = np.power(h_norm, 1.2)
+        h_emph = np.power(h_norm, 1.3)
         heat_rgb = cmap(h_emph)[..., :3]
 
-        alpha = (0.15 + 0.65 * h_emph)[..., None]
+        alpha = (0.12 + 0.68 * h_emph)[..., None]
         blended = np.clip(
             (1.0 - alpha) * (gen_gray_rgb * 0.85) + alpha * heat_rgb, 0.0, 1.0
         )
 
         ax.imshow(blended)
-        title_text = f"#{tok_pos}「{word}」\n(peak: {h_max:.3f})"
+        title_text = f"#{tok_pos}「{word}」\n(peak: {peak_raw:.3f})"
         if font_prop is not None:
             ax.set_title(title_text, fontproperties=font_prop, fontsize=10)
         else:
@@ -695,7 +764,8 @@ def ddim_sample_batch(
     capture_final_attn=False,
 ):
     B, C, H, W = shape
-    x = torch.randn(shape, device=device)
+    gen = torch.Generator(device=device).manual_seed(42)
+    x = torch.randn(shape, generator=gen, device=device)
     progression_tensors = []
     final_attn_weights = None
 
@@ -765,13 +835,15 @@ def generate_evaluation_samples(
     3. attention_heatmap.png (代表1枚目: トークン毎のCross-Attentionヒートマップ)
     を生成し、3枚の平均 PSNR と SSIM を返す。
     """
+    # 2. generate_evaluation_samples のサンプル選択部分 (643〜648行目) を以下に差し替え
     model.eval()
     num_samples = 3
 
+    # 【修正】毎回同じ3枚（先頭3枚）を固定評価して PSNR/SSIM のランダムなブレをなくす
     if len(dataset) >= num_samples:
-        indices = random.sample(range(len(dataset)), num_samples)
+        indices = list(range(num_samples))
     else:
-        indices = [random.choice(range(len(dataset))) for _ in range(num_samples)]
+        indices = [i % len(dataset) for i in range(num_samples)]
 
     stride = max(1, max_steps // 10)
     capture_steps = set(

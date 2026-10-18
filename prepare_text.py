@@ -50,10 +50,7 @@ def create_caption_tensors(subset, datasets_root="datasets"):
     text_encoder = AutoModel.from_pretrained(model_name)
     text_encoder.eval()
 
-    torch.manual_seed(42)
-    dim_proj = nn.Linear(768, 128)
-    dim_proj.eval()
-
+    # 【修正】意味空間を壊す固定ランダム射影(dim_proj)を廃止し、768次元を直接保存する
     with torch.no_grad():
         for base_name, text in captions.items():
             inputs = tokenizer(
@@ -67,8 +64,9 @@ def create_caption_tensors(subset, datasets_root="datasets"):
             outputs = text_encoder(**inputs)
             hidden_states = outputs.last_hidden_state  # [1, 256, 768]
 
-            # 4トークンの切り捨てを行わず、全256トークンを [256, 128] として保存
-            context_tensor = dim_proj(hidden_states).squeeze(0)
+            # 【追加】[PAD] トークン位置の特徴量を完全に 0.0 にマスクして保存
+            attn_mask = inputs["attention_mask"].unsqueeze(-1).float()  # [1, 256, 1]
+            context_tensor = (hidden_states * attn_mask).squeeze(0)  # [256, 768]
 
             save_name = f"{base_name}.pt"
             save_path = os.path.join(target_dir, save_name)
