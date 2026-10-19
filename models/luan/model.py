@@ -22,8 +22,8 @@ def get_2d_normalized_sincos_pos_embed(embed_dim, h, w, device):
     解像度やアスペクト比が変化しても破綻しないよう、
     座標を [-1.0, 1.0] に正規化してから生成する2D位置エンコーディング
     """
-    grid_h = torch.linspace(-1.0, 1.0, steps=h, device=device) * (h / max(h, w)) * 16.0
-    grid_w = torch.linspace(-1.0, 1.0, steps=w, device=device) * (w / max(h, w)) * 16.0
+    grid_h = torch.linspace(-1.0, 1.0, steps=h, device=device) * (h / max(h, w)) * 4.0
+    grid_w = torch.linspace(-1.0, 1.0, steps=w, device=device) * (w / max(h, w)) * 4.0
     grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
 
     emb_h = get_timestep_embedding(grid_h.flatten(), embed_dim // 2)

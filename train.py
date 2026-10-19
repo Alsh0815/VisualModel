@@ -1191,7 +1191,7 @@ def run_training(
             snr = alpha_cumprod.view(-1) / torch.clamp(
                 1.0 - alpha_cumprod.view(-1), min=1e-5
             )
-            snr_weight = torch.clamp(snr, max=5.0)
+            snr_weight = torch.clamp(snr, min=0.1, max=5.0)
 
             mse_loss = F.mse_loss(predicted_x0, images, reduction="none").mean(
                 dim=[1, 2, 3]
@@ -1200,8 +1200,7 @@ def run_training(
                 dim=[1, 2, 3]
             )
 
-            # combined_loss = 0.5 * mse_loss + 0.5 * l1_loss
-            combined_loss = 0.3 * mse_loss + 0.7 * l1_loss
+            combined_loss = 0.48 * mse_loss + 0.52 * l1_loss
             loss = (combined_loss * snr_weight).mean()
 
             loss.backward()
