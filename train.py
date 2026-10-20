@@ -1200,7 +1200,7 @@ def run_training(
                 dim=[1, 2, 3]
             )
 
-            combined_loss = 0.48 * mse_loss + 0.52 * l1_loss
+            combined_loss = 0.55 * mse_loss + 0.45 * l1_loss
             loss = (combined_loss * snr_weight).mean()
 
             loss.backward()
