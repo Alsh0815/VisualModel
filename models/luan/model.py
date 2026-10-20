@@ -339,9 +339,11 @@ class TripleStreamModel(nn.Module):
         # === 6. Final Modulation & Output ===
         gamma = self.fusion_AB_to_C_gamma(up_AB)
         beta = self.fusion_AB_to_C_beta(up_AB)
-        fusion_final = (1.0 + gamma) * out_C + beta
 
-        output = self.out_proj(self.out_act(self.out_norm(fusion_final)))
+        normalized_C = self.out_norm(out_C)
+        fusion_final = (1.0 + gamma) * normalized_C + beta
+
+        output = self.out_proj(self.out_act(fusion_final))
         return output
 
 
