@@ -38,6 +38,10 @@ def create_caption_tensors(subset, datasets_root="datasets"):
             f"指定されたデータセットフォルダが存在しません: {target_dir}"
         )
 
+    # テンソル保存用の専用フォルダを作成
+    tensors_dir = os.path.join(target_dir, "tensors")
+    os.makedirs(tensors_dir, exist_ok=True)
+
     captions = load_captions(target_dir)
     if not captions:
         print(
@@ -50,7 +54,6 @@ def create_caption_tensors(subset, datasets_root="datasets"):
     text_encoder = AutoModel.from_pretrained(model_name)
     text_encoder.eval()
 
-    # 【修正】意味空間を壊す固定ランダム射影(dim_proj)を廃止し、768次元を直接保存する
     with torch.no_grad():
         for base_name, text in captions.items():
             inputs = tokenizer(
@@ -64,18 +67,18 @@ def create_caption_tensors(subset, datasets_root="datasets"):
             outputs = text_encoder(**inputs)
             hidden_states = outputs.last_hidden_state  # [1, 256, 768]
 
-            # 【追加】[PAD] トークン位置の特徴量を完全に 0.0 にマスクして保存
             attn_mask = inputs["attention_mask"].unsqueeze(-1).float()  # [1, 256, 1]
             context_tensor = (hidden_states * attn_mask).squeeze(0)  # [256, 768]
 
             save_name = f"{base_name}.pt"
-            save_path = os.path.join(target_dir, save_name)
+            # 保存先を tensors_dir に変更
+            save_path = os.path.join(tensors_dir, save_name)
             torch.save(context_tensor, save_path)
 
-            # ヒートマップ表示用にトークン文字列リストも保存
             ids = inputs["input_ids"][0].tolist()
             tokens = tokenizer.convert_ids_to_tokens(ids)
-            tok_json_path = os.path.join(target_dir, f"{base_name}.tokens.json")
+            # JSONの保存先も tensors_dir に変更
+            tok_json_path = os.path.join(tensors_dir, f"{base_name}.tokens.json")
             with open(tok_json_path, "w", encoding="utf-8") as f:
                 json.dump(tokens, f, ensure_ascii=False)
 

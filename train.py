@@ -443,6 +443,8 @@ def load_sample_caption_and_tokens(dataset, ds_idx, seq_len):
     target_dir = os.path.dirname(img_path)
     base_name = os.path.basename(base_no_ext)
 
+    tensors_dir = os.path.join(target_dir, "tensors")
+
     # 1. 個別の .txt ファイルを読み込む
     caption = None
     txt_path = f"{base_no_ext}.txt"
@@ -458,7 +460,7 @@ def load_sample_caption_and_tokens(dataset, ds_idx, seq_len):
             caption = data.get(os.path.basename(img_path)) or data.get(base_name)
 
     # 2. prepare_text.py が保存した .tokens.json があれば優先使用
-    tok_json_path = f"{base_no_ext}.tokens.json"
+    tok_json_path = os.path.join(tensors_dir, f"{base_name}.tokens.json")
     if os.path.exists(tok_json_path):
         with open(tok_json_path, "r", encoding="utf-8") as f:
             raw_tokens = json.load(f)

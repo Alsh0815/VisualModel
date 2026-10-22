@@ -10,9 +10,7 @@ from torchvision.transforms import functional as TF
 from PIL import Image
 
 
-def generate_aspect_buckets(
-    base_size=256, step=32, max_ratio=2.0, min_short_edge=256
-):
+def generate_aspect_buckets(base_size=256, step=32, max_ratio=2.0, min_short_edge=256):
     """
     短辺を min_short_edge (デフォルト256px) 以上に保証しつつ、
     step(32)の倍数となる (H, W) アスペクト比バケット一覧を自動生成する。
@@ -97,7 +95,7 @@ class VisualDataset(Dataset):
                 base_name = os.path.splitext(file)[0]
                 img_path = os.path.join(self.data_dir, file)
                 text_filename = f"{base_name}.pt"
-                text_path = os.path.join(self.data_dir, text_filename)
+                text_path = os.path.join(self.data_dir, "tensors", text_filename)
 
                 if not os.path.exists(text_path) and "image" in base_name:
                     legacy_path = os.path.join(
