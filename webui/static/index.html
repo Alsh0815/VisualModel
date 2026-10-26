@@ -1,0 +1,506 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VisualModel Dataset Studio</title>
+  <!-- Google Fonts: Inter & Noto Sans JP -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&family=Noto+Sans+JP:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- トップナビゲーションバー -->
+    <header class="app-header">
+      <div class="header-left">
+        <div class="brand">
+          <div class="brand-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <rect x="3" y="3" width="18" height="18" rx="3" ry="3"></rect>
+              <circle cx="8.5" cy="8.5" r="1.5"></circle>
+              <polyline points="21 15 16 10 5 21"></polyline>
+            </svg>
+          </div>
+          <div>
+            <h1 class="brand-title">Dataset Studio</h1>
+            <span class="brand-subtitle">VisualModel Caption Manager</span>
+          </div>
+        </div>
+
+        <!-- サブセット選択ドロップダウン -->
+        <div class="subset-selector-wrapper">
+          <label for="subsetSelect" class="selector-label">データセット:</label>
+          <div class="custom-select-container">
+            <select id="subsetSelect" class="custom-select" title="編集するデータセットサブフォルダを選択">
+              <option value="" disabled selected>読込中...</option>
+            </select>
+            <div class="select-arrow">▼</div>
+          </div>
+          <button id="refreshBtn" class="icon-btn" title="データセットを再スキャン">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M23 4v6h-6"></path>
+              <path d="M1 20v-6h6"></path>
+              <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path>
+            </svg>
+          </button>
+        </div>
+      </div>
+
+      <!-- 中央: サブセット統計バッジ -->
+      <div class="header-center">
+        <div class="stats-badge" id="headerStats">
+          <span class="badge-item">
+            <strong id="statImageCount">0</strong> 枚
+          </span>
+          <span class="badge-separator">|</span>
+          <span class="badge-item">
+            <strong id="statAvgChars">0</strong> 文字/枚 (平均)
+          </span>
+          <span class="badge-separator">|</span>
+          <span class="badge-item">
+            <strong id="statTotalChars">0</strong> 総文字数
+          </span>
+        </div>
+      </div>
+
+      <!-- 右側アクションボタン群 -->
+      <div class="header-right">
+        <!-- 単語分析・統計ボタン -->
+        <button id="openWordStatsBtn" class="btn btn-secondary">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <line x1="18" y1="20" x2="18" y2="10"></line>
+            <line x1="12" y1="20" x2="12" y2="4"></line>
+            <line x1="6" y1="20" x2="6" y2="14"></line>
+          </svg>
+          <span>単語統計・頻度分析</span>
+        </button>
+
+        <!-- 一括置換ボタン -->
+        <button id="openBatchReplaceBtn" class="btn btn-outline" title="データセット全体で指定単語を一括置換">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="1 4 1 10 7 10"></polyline>
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+          </svg>
+          <span>一括置換</span>
+        </button>
+
+        <!-- テンソル生成 (prepare_text) -->
+        <button id="runPrepareBtn" class="btn btn-primary" title="prepare_text.py を実行してテンソルを再生成">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polygon points="5 3 19 12 5 21 5 3"></polygon>
+          </svg>
+          <span>テンソル生成</span>
+        </button>
+      </div>
+    </header>
+
+    <!-- メインワークスペース -->
+    <main class="main-layout">
+      <!-- 左ペイン: 画像ギャラリー & リスト -->
+      <section class="gallery-pane">
+        <!-- ギャラリーツールバー -->
+        <div class="gallery-toolbar">
+          <div class="search-box">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="search-icon">
+              <circle cx="11" cy="11" r="8"></circle>
+              <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+            </svg>
+            <input type="text" id="searchInput" placeholder="プロンプトやファイル名を検索..." autocomplete="off">
+            <button id="clearSearchBtn" class="clear-icon" style="display:none;">&times;</button>
+          </div>
+
+          <div class="toolbar-controls">
+            <!-- 単語フィルタータグ表示領域（単語クリック時に表示） -->
+            <div id="activeWordFilter" class="active-filter-badge" style="display: none;">
+              <span class="filter-label">単語絞り込み:</span>
+              <span id="activeFilterWord" class="filter-word">ケモ耳</span>
+              <button id="clearWordFilterBtn" class="remove-filter-btn" title="絞り込みを解除">&times;</button>
+            </div>
+
+            <!-- 並び順ソート -->
+            <select id="sortSelect" class="control-select">
+              <option value="name_asc">ファイル名 (昇順)</option>
+              <option value="name_desc">ファイル名 (降順)</option>
+              <option value="chars_desc">文字数 (多い順)</option>
+              <option value="chars_asc">文字数 (少ない順)</option>
+              <option value="res_desc">解像度 (大きい順)</option>
+              <option value="mtime_desc">更新日時 (新しい順)</option>
+            </select>
+
+            <!-- グリッドサイズスライダー -->
+            <div class="grid-size-control" title="サムネイルサイズ">
+              <span class="size-icon small">▪</span>
+              <input type="range" id="gridSizeSlider" min="110" max="220" value="140" step="10">
+              <span class="size-icon large">■</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- アイテム数表示バー -->
+        <div class="gallery-status-bar">
+          <span id="filteredCountText">全 0 件を表示中</span>
+          <span class="nav-hint">ショートカット: <kbd>Ctrl</kbd> + <kbd>←</kbd> / <kbd>→</kbd> で画像切替</span>
+        </div>
+
+        <!-- 画像カードグリッド -->
+        <div class="gallery-grid" id="galleryGrid">
+          <div class="empty-state">
+            <div class="spinner"></div>
+            <p>データセットを読み込んでいます...</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- リサイズ用ディバイダー -->
+      <div class="pane-resizer" id="paneResizer"></div>
+
+      <!-- 右ペイン: プレビュー ＆ プロンプトエディタ -->
+      <section class="editor-pane" id="editorPane">
+        <div class="editor-header">
+          <div class="editor-title-area">
+            <span class="editor-file-badge" id="currentExt">PNG</span>
+            <h2 class="editor-filename" id="currentFilename" title="クリックしてコピー">画像を選択してください</h2>
+            <span id="saveStatusBadge" class="status-badge saved">保存済み</span>
+          </div>
+
+          <div class="editor-nav-actions">
+            <button id="prevBtn" class="btn btn-icon-round" title="前の画像 (Ctrl+Left)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="15 18 9 12 15 6"></polyline>
+              </svg>
+            </button>
+            <span id="currentPositionIndex" class="nav-counter">- / -</span>
+            <button id="nextBtn" class="btn btn-icon-round" title="次の画像 (Ctrl+Right)">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="9 18 15 12 9 6"></polyline>
+              </svg>
+            </button>
+          </div>
+        </div>
+
+        <!-- 上部: 画像プレビューエリア -->
+        <div class="preview-container">
+          <div class="image-stage" id="imageStage">
+            <img id="previewImage" src="" alt="プレビュー画像" style="display: none;">
+            <div id="noImageSelected" class="no-selection-placeholder">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                <circle cx="8.5" cy="8.5" r="1.5"></circle>
+                <polyline points="21 15 16 10 5 21"></polyline>
+              </svg>
+              <p>左側のギャラリーから画像をクリックしてください</p>
+            </div>
+            <!-- 画像拡大モーダル用トリガー -->
+            <button id="zoomImageBtn" class="zoom-trigger-btn" title="画像を全画面でプレビュー" style="display:none;">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M15 3h6v6"></path>
+                <path d="M9 21H3v-6"></path>
+                <path d="M21 3l-7 7"></path>
+                <path d="M3 21l7-7"></path>
+              </svg>
+            </button>
+          </div>
+
+          <!-- メタデータカード -->
+          <div class="image-meta-bar" id="imageMetaBar" style="display:none;">
+            <div class="meta-item">
+              <span class="meta-label">解像度:</span>
+              <strong id="metaResolution">-</strong>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">アスペクト比:</span>
+              <strong id="metaAspect">-</strong>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">ファイル容量:</span>
+              <strong id="metaFileSize">-</strong>
+            </div>
+            <div class="meta-item">
+              <span class="meta-label">テンソル (.pt):</span>
+              <span id="metaTensorBadge" class="tensor-tag">未生成</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- 下部: プロンプト編集エリア -->
+        <div class="prompt-section">
+          <!-- リアルタイム文字数・統計インジケーターバー -->
+          <div class="counter-dashboard">
+            <div class="counter-item primary">
+              <span class="counter-title">文字数 (スペース込)</span>
+              <span class="counter-number" id="countTotal">0</span>
+            </div>
+            <div class="counter-item">
+              <span class="counter-title">空白除外</span>
+              <span class="counter-number" id="countNoSpaces">0</span>
+            </div>
+            <div class="counter-item">
+              <span class="counter-title">単語数 (推定)</span>
+              <span class="counter-number" id="countWords">0</span>
+            </div>
+            <div class="counter-item">
+              <span class="counter-title">行数</span>
+              <span class="counter-number" id="countLines">0</span>
+            </div>
+            <div class="counter-item accent">
+              <span class="counter-title">BERTトークン目安</span>
+              <span class="counter-number" id="countTokens">0</span>
+              <span class="token-limit-badge" id="tokenLimitBadge">/ 256</span>
+            </div>
+          </div>
+
+          <!-- テキストエリア -->
+          <div class="textarea-wrapper">
+            <textarea 
+              id="promptTextarea" 
+              placeholder="画像の説明（プロンプト・キャプション）を入力してください..." 
+              spellcheck="false"
+              disabled
+            ></textarea>
+          </div>
+
+          <!-- エディタフッターアクション -->
+          <div class="editor-actions">
+            <div class="action-hints">
+              <span class="key-shortcut"><kbd>Ctrl</kbd> + <kbd>S</kbd> で即時保存</span>
+            </div>
+
+            <div class="action-buttons">
+              <button id="copyPromptBtn" class="btn btn-outline" disabled title="プロンプトをクリップボードにコピー">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span>コピー</span>
+              </button>
+
+              <button id="resetPromptBtn" class="btn btn-outline" disabled title="編集前の状態に戻す">
+                元に戻す
+              </button>
+
+              <button id="savePromptBtn" class="btn btn-save" disabled>
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path>
+                  <polyline points="17 21 17 13 7 13 7 21"></polyline>
+                  <polyline points="7 3 7 8 15 8"></polyline>
+                </svg>
+                <span>保存する</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- ==================== モーダル 1: 単語出現頻度・統計 ==================== -->
+  <div class="modal-overlay" id="wordStatsModal" style="display: none;">
+    <div class="modal-window modal-xl">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+              <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"></path>
+            </svg>
+          </div>
+          <div>
+            <h3 class="modal-title">データセット単語出現頻度・統計</h3>
+            <p class="modal-subtitle">データセット全体でどの単語が何回使用されているかを一覧・可視化します</p>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closeWordStatsBtn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <!-- 統計概要カード群 -->
+        <div class="stats-overview-cards">
+          <div class="stat-card">
+            <span class="stat-card-label">総出現単語数</span>
+            <strong class="stat-card-value" id="statsTotalTokens">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card-label">ユニーク単語数</span>
+            <strong class="stat-card-value" id="statsUniqueWords">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card-label">対象ファイル数</span>
+            <strong class="stat-card-value" id="statsTotalDocs">0</strong>
+          </div>
+          <div class="stat-card">
+            <span class="stat-card-label">解析エンジン</span>
+            <span class="stat-card-badge" id="statsEngineName">内蔵エンジン</span>
+          </div>
+        </div>
+
+        <!-- フィルタ & タブ切り替え -->
+        <div class="stats-controls-row">
+          <div class="stats-tabs">
+            <button class="tab-btn active" data-tab="tabRanking">頻度ランキング</button>
+            <button class="tab-btn" data-tab="tabCloud">タグ / ワードクラウド</button>
+          </div>
+
+          <div class="stats-filter-group">
+            <div class="search-box-sm">
+              <input type="text" id="wordSearchInput" placeholder="単語を検索..." autocomplete="off">
+            </div>
+
+            <label class="checkbox-label" title="助詞・記号など頻出の付属語を除外します">
+              <input type="checkbox" id="filterStopwordsCheck" checked>
+              <span>助詞・ストップワード除外</span>
+            </label>
+
+            <div class="min-len-select">
+              <label for="minWordLenSelect">最小文字数:</label>
+              <select id="minWordLenSelect">
+                <option value="1">1文字以上</option>
+                <option value="2" selected>2文字以上</option>
+                <option value="3">3文字以上</option>
+              </select>
+            </div>
+
+            <button id="exportCsvBtn" class="btn btn-sm btn-outline">CSV出力</button>
+          </div>
+        </div>
+
+        <!-- タブ 1: ランキングテーブル -->
+        <div class="tab-content active" id="tabRanking">
+          <div class="table-container">
+            <table class="word-stats-table">
+              <thead>
+                <tr>
+                  <th style="width: 60px;">順位</th>
+                  <th>単語</th>
+                  <th style="width: 120px;">出現回数</th>
+                  <th style="width: 120px;">含まれる画像数</th>
+                  <th style="width: 180px;">出現割合</th>
+                  <th style="width: 100px;">アクション</th>
+                </tr>
+              </thead>
+              <tbody id="wordStatsTableBody">
+                <tr>
+                  <td colspan="6" class="text-center">データを読み込んでいます...</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <!-- タブ 2: ワードクラウド / タグ一覧 -->
+        <div class="tab-content" id="tabCloud" style="display: none;">
+          <div class="cloud-info-note">
+            ※ 単語をクリックすると、その単語を含む画像一覧を即座に絞り込み表示します。
+          </div>
+          <div class="word-cloud-container" id="wordCloudContainer">
+            <!-- JSで動的生成 -->
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <span class="footer-tip">💡 単語の「絞り込み」ボタンを押すと、該当する画像だけをギャラリーに表示できます。</span>
+        <button class="btn btn-secondary" id="closeWordStatsFooterBtn">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== モーダル 2: 一括置換 ==================== -->
+  <div class="modal-overlay" id="batchReplaceModal" style="display: none;">
+    <div class="modal-window">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polyline points="1 4 1 10 7 10"></polyline>
+              <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"></path>
+            </svg>
+          </div>
+          <div>
+            <h3 class="modal-title">プロンプト一括単語置換</h3>
+            <p class="modal-subtitle">データセット内のプロンプトに含まれる単語を一括で置き換えます</p>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closeBatchReplaceBtn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="form-group">
+          <label for="replaceTargetSubset">対象データセット:</label>
+          <select id="replaceTargetSubset" class="custom-select">
+            <option value="current">現在のサブセットのみ</option>
+            <option value="all">全サブセット（datasets配下の全て）</option>
+          </select>
+        </div>
+
+        <div class="form-group">
+          <label for="findWordInput">検索する単語 (置換前):</label>
+          <input type="text" id="findWordInput" class="form-input" placeholder="例: ケモ耳">
+        </div>
+
+        <div class="form-group">
+          <label for="replaceWordInput">置換後の単語:</label>
+          <input type="text" id="replaceWordInput" class="form-input" placeholder="例: 獣耳">
+        </div>
+
+        <div class="preview-area" id="replacePreviewArea" style="display: none;">
+          <h4>置換プレビュー (<span id="replaceCount">0</span> 件の一致):</h4>
+          <div class="preview-list" id="replacePreviewList"></div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="previewReplaceBtn" class="btn btn-outline">プレビュー確認</button>
+        <button id="executeReplaceBtn" class="btn btn-primary" disabled>一括置換を実行</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== モーダル 3: テンソル生成ログ (prepare_text) ==================== -->
+  <div class="modal-overlay" id="prepareModal" style="display: none;">
+    <div class="modal-window modal-lg">
+      <div class="modal-header">
+        <div class="modal-title-group">
+          <div class="modal-icon">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="5 3 19 12 5 21 5 3"></polygon>
+            </svg>
+          </div>
+          <div>
+            <h3 class="modal-title">テンソル生成 (prepare_text.py)</h3>
+            <p class="modal-subtitle">BERTテキストエンコーダでプロンプトの特徴量テンソル(.pt)を生成します</p>
+          </div>
+        </div>
+        <button class="modal-close-btn" id="closePrepareModalBtn">&times;</button>
+      </div>
+
+      <div class="modal-body">
+        <div class="task-status-row">
+          <span>ステータス: <strong id="prepareStatusText">待機中</strong></span>
+          <div class="spinner-sm" id="prepareSpinner" style="display:none;"></div>
+        </div>
+        <div class="terminal-log" id="prepareLogs">
+          準備完了。実行ボタンを押すと処理が開始されます。
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button id="startPrepareBtn" class="btn btn-primary">生成開始</button>
+        <button id="closePrepareFooterBtn" class="btn btn-secondary">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ==================== モーダル 4: 画像フルスクリーンプレビュー ==================== -->
+  <div class="fullscreen-modal" id="fullscreenModal" style="display: none;">
+    <button class="fullscreen-close" id="closeFullscreenBtn">&times;</button>
+    <img id="fullscreenImage" src="" alt="全画面画像">
+  </div>
+
+  <!-- トースト通知コンテナ -->
+  <div class="toast-container" id="toastContainer"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
