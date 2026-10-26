@@ -837,15 +837,14 @@ def generate_evaluation_samples(
     3. attention_heatmap.png (代表1枚目: トークン毎のCross-Attentionヒートマップ)
     を生成し、3枚の平均 PSNR と SSIM を返す。
     """
-    # 2. generate_evaluation_samples のサンプル選択部分 (643〜648行目) を以下に差し替え
     model.eval()
     num_samples = 3
 
-    # 【修正】毎回同じ3枚（先頭3枚）を固定評価して PSNR/SSIM のランダムなブレをなくす
+    # データセットの中から毎回ランダムに3枚を選択（3枚未満の場合は重複を許容）
     if len(dataset) >= num_samples:
-        indices = list(range(num_samples))
+        indices = random.sample(range(len(dataset)), num_samples)
     else:
-        indices = [i % len(dataset) for i in range(num_samples)]
+        indices = [random.choice(range(len(dataset))) for _ in range(num_samples)]
 
     stride = max(1, max_steps // 10)
     capture_steps = set(
