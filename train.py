@@ -1187,22 +1187,26 @@ def run_training(
                 + torch.sqrt(1.0 - alpha_cumprod) * noise
             )
 
-            predicted_x0 = model(noisy_images, contexts, t)
+            use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
+            with torch.amp.autocast(
+                device_type="cuda", dtype=torch.bfloat16, enabled=use_amp
+            ):
+                predicted_x0 = model(noisy_images, contexts, t)
 
-            snr = alpha_cumprod.view(-1) / torch.clamp(
-                1.0 - alpha_cumprod.view(-1), min=1e-5
-            )
-            snr_weight = torch.clamp(snr, min=0.1, max=5.0)
+                snr = alpha_cumprod.view(-1) / torch.clamp(
+                    1.0 - alpha_cumprod.view(-1), min=1e-5
+                )
+                snr_weight = torch.clamp(snr, min=0.1, max=5.0)
 
-            mse_loss = F.mse_loss(predicted_x0, images, reduction="none").mean(
-                dim=[1, 2, 3]
-            )
-            l1_loss = F.l1_loss(predicted_x0, images, reduction="none").mean(
-                dim=[1, 2, 3]
-            )
+                mse_loss = F.mse_loss(predicted_x0, images, reduction="none").mean(
+                    dim=[1, 2, 3]
+                )
+                l1_loss = F.l1_loss(predicted_x0, images, reduction="none").mean(
+                    dim=[1, 2, 3]
+                )
 
-            combined_loss = 0.55 * mse_loss + 0.45 * l1_loss
-            loss = (combined_loss * snr_weight).mean()
+                combined_loss = 0.55 * mse_loss + 0.45 * l1_loss
+                loss = (combined_loss * snr_weight).mean()
 
             loss.backward()
 

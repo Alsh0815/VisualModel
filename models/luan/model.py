@@ -327,8 +327,14 @@ class TripleStreamModel(nn.Module):
         h_C_q = self.norm_C_attn(h_C_flat + pos_embed_C)
 
         ctx_proj = self.text_proj_C(context)
+        # フック登録時（ヒートマップ保存時）のみ重みを返し、通常学習時は FlashAttention で VRAM 爆発を回避
+        need_weights_C = len(self.cross_attn_C._forward_hooks) > 0
         attn_out_C, _ = self.cross_attn_C(
-            h_C_q, ctx_proj, ctx_proj, key_padding_mask=pad_mask
+            h_C_q,
+            ctx_proj,
+            ctx_proj,
+            key_padding_mask=pad_mask,
+            need_weights=need_weights_C,
         )
         h_C_flat = h_C_flat + attn_out_C
         h_C_flat = h_C_flat + self.ffn_C(h_C_flat)
