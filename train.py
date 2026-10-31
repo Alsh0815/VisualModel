@@ -1015,6 +1015,7 @@ def run_training(
     lr=5e-4,
     save_every_epochs=None,
     log_every_epochs=None,
+    use_fp16=False,
     resume=None,
 ):
     print(f"--- Starting Production Training (Subset: {subset}) ---")
@@ -1025,7 +1026,7 @@ def run_training(
 
     # 1. GPUアーキテクチャに応じた自動混合精度 (L4: bfloat16 / T4: float16 + GradScaler)
     use_amp = device.type == "cuda"
-    if use_amp and torch.cuda.is_bf16_supported():
+    if use_amp and (torch.cuda.is_bf16_supported() and not use_fp16):
         amp_dtype = torch.bfloat16
         use_scaler = False
     else:
@@ -1485,6 +1486,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr", type=float, default=5e-4, help="初期学習率 (デフォルト: 5e-4)"
     )
+    parser.add_argument("--use-fp16", action="store_true")
     args = parser.parse_args()
 
     run_training(
@@ -1502,5 +1504,6 @@ if __name__ == "__main__":
         lr=args.lr,
         save_every_epochs=parse_auto_int(args.save_every),
         log_every_epochs=parse_auto_int(args.log_every),
+        use_fp16=args.use_fp16,
         resume=args.resume,
     )
