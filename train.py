@@ -7,6 +7,7 @@ import math
 import time
 import random
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import urllib.request
 
@@ -765,6 +766,7 @@ def ddim_sample_batch(
     shape,
     device,
     max_steps=1000,
+    eval_steps=100,
     capture_steps=None,
     capture_final_attn=False,
 ):
@@ -774,14 +776,30 @@ def ddim_sample_batch(
     progression_tensors = []
     final_attn_weights = None
 
-    for i in reversed(range(max_steps)):
+    # max_steps (例: 1000) の中から eval_steps (例: 100) 個のタイムステップを均等抽出
+    actual_steps = (
+        min(max_steps, eval_steps) if (eval_steps and eval_steps > 0) else max_steps
+    )
+    step_indices = torch.linspace(
+        0, max_steps - 1, actual_steps, dtype=torch.long
+    ).tolist()
+    step_indices.reverse()  # [999, ..., 0]
+
+    if capture_steps is None:
+        stride = max(1, len(step_indices) // 10)
+        capture_set = set(step_indices[::stride] + [step_indices[-1]])
+    else:
+        capture_set = capture_steps
+
+    for idx, i in enumerate(step_indices):
         t = torch.full((B,), i, device=device, dtype=torch.long)
         alpha_cumprod_t = get_cosine_alpha_cumprod(t, max_steps=max_steps).view(
             B, 1, 1, 1
         )
 
-        if i > 0:
-            t_prev = torch.full((B,), i - 1, device=device, dtype=torch.long)
+        if idx < len(step_indices) - 1:
+            prev_i = step_indices[idx + 1]
+            t_prev = torch.full((B,), prev_i, device=device, dtype=torch.long)
             alpha_cumprod_t_prev = get_cosine_alpha_cumprod(
                 t_prev, max_steps=max_steps
             ).view(B, 1, 1, 1)
@@ -789,7 +807,11 @@ def ddim_sample_batch(
             alpha_cumprod_t_prev = torch.ones((B, 1, 1, 1), device=device)
 
         # 最終ステップ (i == 0) で Stream C の Cross-Attention 重みをキャプチャ
-        if capture_final_attn and i == 0 and hasattr(model, "cross_attn_C"):
+        if (
+            capture_final_attn
+            and i == step_indices[-1]
+            and hasattr(model, "cross_attn_C")
+        ):
             captured = {}
             orig_forward = model.cross_attn_C.forward
 
@@ -811,7 +833,7 @@ def ddim_sample_batch(
 
         predicted_x0 = torch.clamp(predicted_x0, -1.0, 1.0)
 
-        if i > 0:
+        if idx < len(step_indices) - 1:
             pred_eps = (x - torch.sqrt(alpha_cumprod_t) * predicted_x0) / torch.sqrt(
                 torch.clamp(1.0 - alpha_cumprod_t, min=1e-5)
             )
@@ -823,7 +845,7 @@ def ddim_sample_batch(
         else:
             x = predicted_x0
 
-        if capture_steps is not None and i in capture_steps:
+        if i in capture_set:
             step_img = torch.clamp((x[0].detach().cpu() + 1.0) / 2.0, 0.0, 1.0)
             progression_tensors.append(step_img)
 
@@ -831,78 +853,99 @@ def ddim_sample_batch(
 
 
 def generate_evaluation_samples(
-    model, dataset, device, save_dir, max_steps=1000, eval_res=None
+    model, dataset, device, save_dir, max_steps=1000, eval_res=None, eval_steps=100
 ):
     """
-    データセットからランダムに3つ選び:
-    1. comparison_grid.png (上段: 元画像3枚, 下段: 生成画像3枚)
-    2. denoising_progression.png (代表1枚目: ステップ毎の推移)
-    3. attention_heatmap.png (代表1枚目: トークン毎のCross-Attentionヒートマップ)
-    を生成し、3枚の平均 PSNR と SSIM を返す。
+    マルチGPU環境では GPU 0 と GPU 1 にサンプル推論を並列分散して実行する。
     """
     model.eval()
     num_samples = 3
 
-    # データセットの中から毎回ランダムに3枚を選択（3枚未満の場合は重複を許容）
     if len(dataset) >= num_samples:
         indices = random.sample(range(len(dataset)), num_samples)
     else:
         indices = [random.choice(range(len(dataset))) for _ in range(num_samples)]
 
-    stride = max(1, max_steps // 10)
-    capture_steps = set(
-        [max_steps - 1] + list(range(max_steps - stride, 0, -stride)) + [0]
+    num_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+    use_amp = device.type == "cuda"
+    # 現在のモデルの実行精度に合わせて autocast の dtype を取得
+    amp_dtype = (
+        torch.bfloat16
+        if (use_amp and torch.cuda.get_device_capability(0)[0] >= 8)
+        else torch.float16
     )
 
-    orig_vis_list = []
-    gen_vis_list = []
-    progression_tensors = []
-    rep_attn_weights = None
-    psnr_list = []
-    ssim_list = []
+    def _infer_single(s_idx, ds_idx, target_dev, net):
+        img, ctx = dataset[ds_idx]
+        img = img.unsqueeze(0).to(target_dev, non_blocking=True)
+        ctx = ctx.unsqueeze(0).to(target_dev, non_blocking=True)
 
-    with torch.no_grad():
-        for s_idx, ds_idx in enumerate(indices):
-            img, ctx = dataset[ds_idx]
-            img = img.unsqueeze(0).to(device)
-            ctx = ctx.unsqueeze(0).to(device)
+        if eval_res is not None:
+            target_h, target_w = eval_res
+            orig_resized = F.interpolate(
+                img, size=(target_h, target_w), mode="bilinear", align_corners=False
+            )
+        else:
+            _, _, target_h, target_w = img.shape
+            orig_resized = img
 
-            if eval_res is not None:
-                target_h, target_w = eval_res
-                orig_resized = F.interpolate(
-                    img, size=(target_h, target_w), mode="bilinear", align_corners=False
-                )
-            else:
-                _, _, target_h, target_w = img.shape
-                orig_resized = img
-
-            is_rep = s_idx == 0
+        is_rep = s_idx == 0
+        with torch.no_grad(), torch.amp.autocast(
+            device_type="cuda", dtype=amp_dtype, enabled=use_amp
+        ):
             gen_x, prog, attn_w = ddim_sample_batch(
-                model,
+                net,
                 ctx,
                 shape=(1, 3, target_h, target_w),
-                device=device,
+                device=target_dev,
                 max_steps=max_steps,
-                capture_steps=capture_steps if is_rep else None,
+                eval_steps=eval_steps,
+                capture_steps=None if is_rep else set(),
                 capture_final_attn=is_rep,
             )
 
-            orig_vis = torch.clamp(
-                (orig_resized[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0
-            )
-            gen_vis = torch.clamp((gen_x[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0)
+        orig_vis = torch.clamp((orig_resized[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0)
+        gen_vis = torch.clamp((gen_x[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0)
+        psnr_val = compute_psnr(orig_vis, gen_vis)
+        ssim_val = compute_ssim(orig_vis, gen_vis)
+        return s_idx, orig_vis, gen_vis, prog, attn_w, psnr_val, ssim_val
 
-            orig_vis_list.append(orig_vis)
-            gen_vis_list.append(gen_vis)
+    results = [None] * num_samples
 
-            # PSNR / SSIM の算出
-            psnr_list.append(compute_psnr(orig_vis, gen_vis))
-            ssim_list.append(compute_ssim(orig_vis, gen_vis))
+    # マルチGPU (T4 x 2 等) の場合:
+    # GPU 0 でサンプル #0 (ヒートマップフック付き) を推論しつつ、同時に GPU 1 でサンプル #1, #2 を並列推論
+    if num_gpus > 1:
+        dev0 = torch.device("cuda:0")
+        dev1 = torch.device("cuda:1")
+        model_gpu1 = copy.deepcopy(model).to(dev1).eval()
 
-            if is_rep:
-                progression_tensors = prog
-                rep_attn_weights = attn_w
+        def worker_gpu0():
+            results[0] = _infer_single(0, indices[0], dev0, model)
 
+        def worker_gpu1():
+            for s_idx in range(1, num_samples):
+                results[s_idx] = _infer_single(s_idx, indices[s_idx], dev1, model_gpu1)
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            f0 = executor.submit(worker_gpu0)
+            f1 = executor.submit(worker_gpu1)
+            f0.result()
+            f1.result()
+
+        del model_gpu1
+        torch.cuda.empty_cache()
+    else:
+        for s_idx, ds_idx in enumerate(indices):
+            results[s_idx] = _infer_single(s_idx, ds_idx, device, model)
+
+    orig_vis_list = [r[1] for r in results]
+    gen_vis_list = [r[2] for r in results]
+    progression_tensors = results[0][3]
+    rep_attn_weights = results[0][4]
+    psnr_list = [r[5] for r in results]
+    ssim_list = [r[6] for r in results]
+
+    with torch.no_grad():
         # 1. comparison_grid.png の保存
         grid_h, grid_w = orig_vis_list[0].shape[1], orig_vis_list[0].shape[2]
         orig_aligned = [
