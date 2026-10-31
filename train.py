@@ -994,7 +994,6 @@ def resolve_resume_paths(resume_arg):
 
     return ckpt_file, ckpt_subdir, parent_run_dir
 
-
 def run_training(
     subset,
     datasets_root="datasets",
@@ -1015,12 +1014,29 @@ def run_training(
     print(f"--- Starting Production Training (Subset: {subset}) ---")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    num_gpus = torch.cuda.device_count() if device.type == "cuda" else 0
+    print(f"Using device: {device} (Visible GPUs: {num_gpus})")
 
-    model = TripleStreamModel(in_channels=3).to(device)
-    ema = EMAModel(model, decay=0.9995)
+    # 1. GPUアーキテクチャに応じた自動混合精度 (L4: bfloat16 / T4: float16 + GradScaler)
+    use_amp = device.type == "cuda"
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+        use_scaler = False
+    else:
+        amp_dtype = torch.float16
+        use_scaler = use_amp
+    scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
+    if use_amp:
+        gpu_names = [torch.cuda.get_device_name(i) for i in range(num_gpus)]
+        print(
+            f"AMP Config -> GPUs: {gpu_names} | dtype: {amp_dtype} | GradScaler: {use_scaler}"
+        )
 
-    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    # 生モデル (raw_model) を構築し、保存・ロード・勾配取得・EMAは常に raw_model を参照する
+    raw_model = TripleStreamModel(in_channels=3).to(device)
+    ema = EMAModel(raw_model, decay=0.9995)
+
+    optimizer = optim.AdamW(raw_model.parameters(), lr=lr, weight_decay=1e-4)
 
     dataset = VisualDataset(
         subset=subset,
@@ -1081,7 +1097,7 @@ def run_training(
         ckpt_data = torch.load(ckpt_file, map_location=device, weights_only=False)
 
         if isinstance(ckpt_data, dict) and "model_state_dict" in ckpt_data:
-            model.load_state_dict(ckpt_data["model_state_dict"])
+            raw_model.load_state_dict(ckpt_data["model_state_dict"])
             ema.ema_model.load_state_dict(
                 ckpt_data.get("ema_state_dict", ckpt_data["model_state_dict"])
             )
@@ -1090,6 +1106,12 @@ def run_training(
             if "scheduler_state_dict" in ckpt_data:
                 scheduler.load_state_dict(ckpt_data["scheduler_state_dict"])
                 scheduler.T_max = epochs
+            if (
+                use_scaler
+                and "scaler_state_dict" in ckpt_data
+                and ckpt_data["scaler_state_dict"] is not None
+            ):
+                scaler.load_state_dict(ckpt_data["scaler_state_dict"])
             start_epoch = int(ckpt_data.get("epoch", 0))
             global_iter = int(
                 ckpt_data.get("global_iter", start_epoch * iters_per_epoch)
@@ -1100,7 +1122,7 @@ def run_training(
                     os.path.join(ckpt_subdir, "metrics.csv")
                 )
         else:
-            model.load_state_dict(ckpt_data)
+            raw_model.load_state_dict(ckpt_data)
             ema.ema_model.load_state_dict(ckpt_data)
 
             csv_path = os.path.join(ckpt_subdir, "metrics.csv")
@@ -1122,6 +1144,15 @@ def run_training(
             for _ in range(start_epoch):
                 scheduler.step()
 
+        # Resume時に重複したエポック行が混入していても start_epoch までにクリーンアップする
+        if metrics_history:
+            dedup = {}
+            for row in metrics_history:
+                ep = int(row["epoch"])
+                if ep <= start_epoch:
+                    dedup[ep] = row
+            metrics_history = [dedup[k] for k in sorted(dedup.keys())]
+
         if parent_run_dir is not None:
             run_dir = parent_run_dir
 
@@ -1130,6 +1161,16 @@ def run_training(
             f"Global Iter: {global_iter}/{epochs * iters_per_epoch} | "
             f"Current LR: {scheduler.get_last_lr()[0]:.2e}"
         )
+
+    # 2. マルチGPU環境 (Kaggle T4x2 等) で、かつ batch_size >= 2 の場合は DataParallel で自動分散
+    if num_gpus > 1 and batch_size >= num_gpus:
+        print(
+            f"Multi-GPU DataParallel Enabled across {num_gpus} GPUs "
+            f"(Per-GPU batch size: {batch_size // num_gpus})"
+        )
+        forward_model = nn.DataParallel(raw_model)
+    else:
+        forward_model = raw_model
 
     if run_dir is None:
         timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1170,11 +1211,11 @@ def run_training(
         grad_norm_C_sum = 0.0
 
         for images, contexts in dataloader:
-            images = images.to(device)
-            contexts = contexts.to(device)
+            images = images.to(device, non_blocking=True)
+            contexts = contexts.to(device, non_blocking=True)
             B = images.size(0)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
             t = torch.randint(0, timesteps, (B,), device=device).long()
             alpha_cumprod = get_cosine_alpha_cumprod(t, max_steps=timesteps).view(
@@ -1187,11 +1228,14 @@ def run_training(
                 + torch.sqrt(1.0 - alpha_cumprod) * noise
             )
 
-            use_amp = device.type == "cuda" and torch.cuda.is_bf16_supported()
             with torch.amp.autocast(
-                device_type="cuda", dtype=torch.bfloat16, enabled=use_amp
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
             ):
-                predicted_x0 = model(noisy_images, contexts, t)
+                # バッチ端数で B == 1 の場合は DataParallel の空デバイスエラーを避けるため raw_model で実行
+                active_net = (
+                    raw_model if (B < num_gpus and num_gpus > 1) else forward_model
+                )
+                predicted_x0 = active_net(noisy_images, contexts, t)
 
                 snr = alpha_cumprod.view(-1) / torch.clamp(
                     1.0 - alpha_cumprod.view(-1), min=1e-5
@@ -1208,30 +1252,35 @@ def run_training(
                 combined_loss = 0.55 * mse_loss + 0.45 * l1_loss
                 loss = (combined_loss * snr_weight).mean()
 
-            loss.backward()
+            # GradScaler対応の backward & unscale & 勾配クリッピング
+            # (use_scaler=False の L4/BF16 環境では通常の loss.backward() / optimizer.step() と完全に等価)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
 
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(raw_model.parameters(), max_norm=1.0)
 
             grad_norm_A_sum += (
-                model.attn_A.in_proj_weight.grad.norm().item()
-                if hasattr(model, "attn_A")
-                and model.attn_A.in_proj_weight.grad is not None
+                raw_model.attn_A.in_proj_weight.grad.norm().item()
+                if hasattr(raw_model, "attn_A")
+                and raw_model.attn_A.in_proj_weight.grad is not None
                 else 0.0
             )
             grad_norm_B_sum += (
-                model.mix_B[0].weight.grad.norm().item()
-                if hasattr(model, "mix_B") and model.mix_B[0].weight.grad is not None
+                raw_model.mix_B[0].weight.grad.norm().item()
+                if hasattr(raw_model, "mix_B")
+                and raw_model.mix_B[0].weight.grad is not None
                 else 0.0
             )
             grad_norm_C_sum += (
-                model.cross_attn_C.in_proj_weight.grad.norm().item()
-                if hasattr(model, "cross_attn_C")
-                and model.cross_attn_C.in_proj_weight.grad is not None
+                raw_model.cross_attn_C.in_proj_weight.grad.norm().item()
+                if hasattr(raw_model, "cross_attn_C")
+                and raw_model.cross_attn_C.in_proj_weight.grad is not None
                 else 0.0
             )
 
-            optimizer.step()
-            ema.update(model)
+            scaler.step(optimizer)
+            scaler.update()
+            ema.update(raw_model)
 
             epoch_loss += loss.item()
             epoch_mse += mse_loss.mean().item()
@@ -1293,38 +1342,41 @@ def run_training(
             ckpt_subdir = os.path.join(run_dir, f"epoch{epoch}_iter{global_iter}")
             os.makedirs(ckpt_subdir, exist_ok=True)
 
-            # 1. サンプル推論・デノイジング過程・トークン別ヒートマップ生成 & PSNR/SSIM 計測
-            eval_psnr, eval_ssim = generate_evaluation_samples(
-                ema.ema_model,
-                dataset,
-                device,
-                ckpt_subdir,
-                max_steps=timesteps,
-                eval_res=eval_res,
-            )
+            # 推論時のVRAMピークも抑えるため autocast 下で評価サンプルを生成
+            with torch.amp.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
+            ):
+                eval_psnr, eval_ssim = generate_evaluation_samples(
+                    ema.ema_model,
+                    dataset,
+                    device,
+                    ckpt_subdir,
+                    max_steps=timesteps,
+                    eval_res=eval_res,
+                )
             record["eval_psnr"] = eval_psnr
             record["eval_ssim"] = eval_ssim
 
-            # 2. 推論互換用のEMA重みファイル (model.pth)
+            # 推論互換用のEMA重みファイル (model.pth)
             ckpt_path = os.path.join(ckpt_subdir, "model.pth")
             torch.save(ema.ema_model.state_dict(), ckpt_path)
 
-            # 3. Resume用の完全状態ファイル (checkpoint.pt)
+            # Resume用の完全状態ファイル (checkpoint.pt)
             full_ckpt_path = os.path.join(ckpt_subdir, "checkpoint.pt")
             torch.save(
                 {
                     "epoch": epoch,
                     "global_iter": global_iter,
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": raw_model.state_dict(),
                     "ema_state_dict": ema.ema_model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "scheduler_state_dict": scheduler.state_dict(),
+                    "scaler_state_dict": scaler.state_dict() if use_scaler else None,
                     "metrics_history": metrics_history,
                 },
                 full_ckpt_path,
             )
 
-            # 4. CSVおよび3段グラフの保存 (PSNR/SSIM反映後)
             save_metrics_csv_and_plot(metrics_history, ckpt_subdir)
 
             print(
@@ -1337,7 +1389,6 @@ def run_training(
     final_path = os.path.join(run_dir, "model_final.pth")
     torch.save(ema.ema_model.state_dict(), final_path)
     print(f"Saved final EMA model weights to {final_path}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Triple-Stream 本番用学習スクリプト")
