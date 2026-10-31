@@ -201,6 +201,9 @@ def compute_psnr(img1, img2):
 @torch.no_grad()
 def compute_ssim(img1, img2, window_size=11):
     """[1, C, H, W] (値域 0〜1) のSSIM (0〜1) をガウシアン窓で算出"""
+    # 型不一致 (BFloat16 / Half と Float32 の混在) を防ぐため float() に統一
+    img1 = img1.float()
+    img2 = img2.float()
     if img1.dim() == 3:
         img1 = img1.unsqueeze(0)
     if img2.dim() == 3:
@@ -884,8 +887,10 @@ def generate_evaluation_samples(
                 capture_final_attn=is_rep,
             )
 
-            orig_vis = torch.clamp((orig_resized[0].cpu() + 1.0) / 2.0, 0.0, 1.0)
-            gen_vis = torch.clamp((gen_x[0].cpu() + 1.0) / 2.0, 0.0, 1.0)
+            orig_vis = torch.clamp(
+                (orig_resized[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0
+            )
+            gen_vis = torch.clamp((gen_x[0].cpu().float() + 1.0) / 2.0, 0.0, 1.0)
 
             orig_vis_list.append(orig_vis)
             gen_vis_list.append(gen_vis)
@@ -993,6 +998,7 @@ def resolve_resume_paths(resume_arg):
         parent_run_dir = None
 
     return ckpt_file, ckpt_subdir, parent_run_dir
+
 
 def run_training(
     subset,
@@ -1389,6 +1395,7 @@ def run_training(
     final_path = os.path.join(run_dir, "model_final.pth")
     torch.save(ema.ema_model.state_dict(), final_path)
     print(f"Saved final EMA model weights to {final_path}")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Triple-Stream 本番用学習スクリプト")
