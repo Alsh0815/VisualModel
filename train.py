@@ -10,6 +10,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import urllib.request
+import ctypes, gc, psutil
 
 import numpy as np
 import torch
@@ -1385,6 +1386,14 @@ def run_training(
                 f"Grad(A/B/C): {grad_norm_A:.4f}/{grad_norm_B:.4f}/{grad_norm_C:.4f} | "
                 f"LR: {current_lr:.2e} | "
                 f"Elapsed: {format_duration(elapsed)} | ETA: {format_duration(eta_sec)}",
+                flush=True,
+            )
+
+            rss0 = psutil.Process().memory_info().rss / 1e9
+            ctypes.CDLL("libc.so.6").malloc_trim(0)
+            rss1 = psutil.Process().memory_info().rss / 1e9
+            print(
+                f"  [MEM] objs:{len(gc.get_objects())} rss:{rss0:.2f}->{rss1:.2f}GB",
                 flush=True,
             )
 
