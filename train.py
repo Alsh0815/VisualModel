@@ -135,18 +135,23 @@ class DistributedAspectRatioBatchSampler(Sampler):
         global_batches = []
 
         for bucket, indices in self.bucket_to_indices.items():
+            if len(indices) == 0:
+                continue
             idx_list = list(indices)
             if self.shuffle:
                 rng.shuffle(idx_list)
 
+            # マルチGPU時でも端数バケットが切り捨てられないよう、
+            # バケット内の要素数が global_batch_size の倍数になるまで先頭から循環補填する
+            rem = len(idx_list) % self.global_batch_size
+            if rem != 0:
+                pad_len = self.global_batch_size - rem
+                # 同じバケット内から補填するため解像度(H, W)が100%一致し、DDP同期ずれが起きない
+                pad_pool = idx_list * ((pad_len // len(idx_list)) + 1)
+                idx_list.extend(pad_pool[:pad_len])
+
             for i in range(0, len(idx_list), self.global_batch_size):
                 batch = idx_list[i : i + self.global_batch_size]
-                if self.num_replicas > 1:
-                    # マルチGPU時は各GPUに均等配分できるサイズに切り詰める
-                    usable_len = (len(batch) // self.num_replicas) * self.num_replicas
-                    if usable_len == 0:
-                        continue
-                    batch = batch[:usable_len]
                 global_batches.append(batch)
 
         if self.shuffle:
