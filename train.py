@@ -1536,17 +1536,6 @@ def run_training(
                         flush=True,
                     )
 
-                    rss0 = psutil.Process().memory_info().rss / 1e9
-                    try:
-                        ctypes.CDLL("libc.so.6").malloc_trim(0)
-                    except Exception:
-                        pass
-                    rss1 = psutil.Process().memory_info().rss / 1e9
-                    print(
-                        f"  [MEM] objs:{len(gc.get_objects())} rss:{rss0:.2f}->{rss1:.2f}GB",
-                        flush=True,
-                    )
-
             if is_save_step:
                 if is_main_process:
                     ckpt_subdir = os.path.join(
