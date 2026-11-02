@@ -22,8 +22,8 @@ def get_2d_normalized_sincos_pos_embed(embed_dim, h, w, device):
     解像度やアスペクト比が変化しても破綻しないよう、
     座標を [-1.0, 1.0] に正規化してから生成する2D位置エンコーディング
     """
-    grid_h = torch.linspace(-1.0, 1.0, steps=h, device=device) * (h / max(h, w)) * 4.0
-    grid_w = torch.linspace(-1.0, 1.0, steps=w, device=device) * (w / max(h, w)) * 4.0
+    grid_h = torch.linspace(-1.0, 1.0, steps=h, device=device) * (h / max(h, w)) * 64.0
+    grid_w = torch.linspace(-1.0, 1.0, steps=w, device=device) * (w / max(h, w)) * 64.0
     grid_h, grid_w = torch.meshgrid(grid_h, grid_w, indexing="ij")
 
     emb_h = get_timestep_embedding(grid_h.flatten(), embed_dim // 2)
@@ -216,7 +216,7 @@ class TripleStreamModel(nn.Module):
         """
         _, _, H, W = x.shape
         target_h, target_w = max(8, H // 2), max(8, W // 2)
-        max_edge_b = self.max_tokens_A_edge * 3  # 長辺最大96程度に抑えて中域構造に集中
+        max_edge_b = self.max_tokens_A_edge * 6  # 長辺最大192程度に抑えて中域構造に集中
         if max(target_h, target_w) > max_edge_b:
             scale = max_edge_b / float(max(target_h, target_w))
             target_h = max(8, int(round(target_h * scale / 2.0)) * 2)
