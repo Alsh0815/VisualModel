@@ -30,7 +30,6 @@ import matplotlib.font_manager as fm
 from models.luan.model import TripleStreamModel
 from dataset import VisualDataset, AspectRatioBatchSampler
 
-
 _JP_FONT_PROP = None
 
 
@@ -1404,7 +1403,8 @@ def run_training(
 
                 optimizer.zero_grad(set_to_none=True)
 
-                t = torch.randint(0, timesteps, (B,), device=device).long()
+                # 1. t=0 (ノイズ完全ゼロの恒等写像) を除外し、最終仕上げステップの精度を上げる
+                t = torch.randint(1, timesteps, (B,), device=device).long()
                 alpha_cumprod = get_cosine_alpha_cumprod(t, max_steps=timesteps).view(
                     B, 1, 1, 1
                 )
@@ -1415,6 +1415,7 @@ def run_training(
                     + torch.sqrt(1.0 - alpha_cumprod) * noise
                 )
 
+                # 2. 損失計算に「低ノイズ域限定の空間勾配(エッジ) L1 損失」を軽く追加 (重み 0.1)
                 with torch.amp.autocast(
                     device_type="cuda", dtype=amp_dtype, enabled=use_amp
                 ):
@@ -1432,7 +1433,23 @@ def run_training(
                         dim=[1, 2, 3]
                     )
 
-                    combined_loss = 0.55 * mse_loss + 0.45 * l1_loss
+                    # 水平・垂直の1px差分によるエッジ損失（線画・瞳の輪郭を鋭くする）
+                    dx_pred = predicted_x0[:, :, :, 1:] - predicted_x0[:, :, :, :-1]
+                    dx_true = images[:, :, :, 1:] - images[:, :, :, :-1]
+                    dy_pred = predicted_x0[:, :, 1:, :] - predicted_x0[:, :, :-1, :]
+                    dy_true = images[:, :, 1:, :] - images[:, :, :-1, :]
+                    edge_loss = F.l1_loss(dx_pred, dx_true, reduction="none").mean(
+                        dim=[1, 2, 3]
+                    ) + F.l1_loss(dy_pred, dy_true, reduction="none").mean(
+                        dim=[1, 2, 3]
+                    )
+                    low_noise_mask = (alpha_cumprod.view(-1) > 0.5).float()
+
+                    combined_loss = (
+                        0.55 * mse_loss
+                        + 0.45 * l1_loss
+                        + 0.10 * edge_loss * low_noise_mask
+                    )
                     loss = (combined_loss * snr_weight).mean()
 
                 scaler.scale(loss).backward()
