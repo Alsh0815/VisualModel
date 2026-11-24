@@ -1712,7 +1712,7 @@ if __name__ == "__main__":
         help="指定するとマルチアスペクト比を無効化し、base-sizeの正方形に固定する",
     )
     parser.add_argument(
-        "--lr", type=float, default=5e-4, help="初期学習率 (デフォルト: 5e-4)"
+        "--lr", type=float, default=3e-4, help="初期学習率 (デフォルト: 3e-4)"
     )
     parser.add_argument("--use-fp16", action="store_true")
     args = parser.parse_args()
